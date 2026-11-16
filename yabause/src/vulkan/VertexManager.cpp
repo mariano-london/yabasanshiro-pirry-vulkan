@@ -38,6 +38,18 @@ void VertexManager::init(unsigned int vertexSize, unsigned int indexSize) {
 
   VkDevice device = vulkan->getDevice();
 
+  /* Test hook (instrumentation): YABA_VK_VM_DIV=N divides the block sizes by N so the "buffer Over" path
+     (advance to a new block, the vector reallocating under a held reference) is exercised in a short run. */
+  {
+    const char * e = getenv("YABA_VK_VM_DIV");
+    int div = e ? atoi(e) : 1;
+    if (div > 1) {
+      vertexSize = vertexSize / div; if (vertexSize < 64) vertexSize = 64;
+      indexSize = indexSize / div;   if (indexSize < 96) indexSize = 96;
+      printf("VMDIV: vertex blocks divided by %d -> %u vertices, %u indices\n", div, (unsigned)vertexSize, (unsigned)indexSize);
+    }
+  }
+
   VertexBlock block;
 
   genBlock(block, sizeof(Vertex) * vertexSize, sizeof(uint16_t) * indexSize);
@@ -167,20 +179,24 @@ void VertexManager::add(
 
     vertexBlocks[currentBlock].currentIndex = 0;
     vertexBlocks[currentBlock].currentVertex = 0;
-    last = vertexBlocks[currentBlock];
+    /* NOT "last = vertexBlocks[currentBlock]": `last` is a reference to the OLD block, and push_back() above may have
+       reallocated the vector, leaving it dangling; the assignment then overwrote the old block with the new one's
+       fields and every write below went into a stale copy (upstream: "Fix: break vertex buffer"). Re-select instead. */
   }
+
+  VertexBlock & cur = vertexBlocks[currentBlock];
 
   // copy vertex buffer
   bufferSize = sizeof(Vertex) * vertices.size();
-  memcpy(last.vdata + last.currentVertex, vertices.data(), (size_t)bufferSize);
-  vertexOffset = last.currentVertex;
-  last.currentVertex += bufferSize;
+  memcpy(cur.vdata + cur.currentVertex, vertices.data(), (size_t)bufferSize);
+  vertexOffset = cur.currentVertex;
+  cur.currentVertex += bufferSize;
 
   // copy index buffer
   bufferSize = sizeof(indices[0]) * indices.size();
-  memcpy(last.idata + last.currentIndex, indices.data(), (size_t)bufferSize);
-  indexOffset = last.currentIndex;
-  last.currentIndex += bufferSize;
+  memcpy(cur.idata + cur.currentIndex, indices.data(), (size_t)bufferSize);
+  indexOffset = cur.currentIndex;
+  cur.currentIndex += bufferSize;
 
   block = currentBlock;
   vertexSize = vertices.size();
@@ -208,7 +224,7 @@ void VertexManager::flush(VkCommandBuffer commandBuffer) {
     VkMemoryBarrier memoryBarrier = {};
     memoryBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
     memoryBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-      memoryBarrier.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
+      memoryBarrier.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT;
 
     vkCmdPipelineBarrier(
       commandBuffer,

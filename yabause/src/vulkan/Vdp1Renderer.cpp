@@ -18,7 +18,10 @@ along with YabaSanshiro; if not, write to the Free Software
 Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 */
 
+#include <algorithm>
 #include "Vdp1Renderer.h"
+#include "ShaderCache.h"
+#include "Shared.h"   /* YabaVkSubmit: traced queue submits */
 #include "VIDVulkan.h"
 #include "VulkanInitializers.hpp"
 #include "VulkanTools.h"
@@ -98,6 +101,7 @@ Vdp1Renderer::Vdp1Renderer(int width, int height, VIDVulkan * vulkan) {
 }
 
 Vdp1Renderer::~Vdp1Renderer() {
+  completePending();
 
   delete pipleLineFactory;
   VkDevice device = vulkan->getDevice();
@@ -135,6 +139,7 @@ void Vdp1Renderer::setUp() {
   createUniformBuffer();
   prepareOffscreen();
 
+  gpuTimer.init(vulkan->getDevice(), vulkan->getPhysicalDevice(), vulkan->getVulkanQueue(), vulkan->getVulkanGraphicsQueueFamilyIndex(), "vdp1");
   tm = new TextureManager(vulkan);
   tm->init(512, 512);
 
@@ -154,13 +159,14 @@ void Vdp1Renderer::createUniformBuffer()
 }
 
 void Vdp1Renderer::changeResolution(int width, int height) {
+  completePending();
 
   if (width == this->width && height == this->height) return;
 
   this->width = width;
   this->height = height;
 
-  vkQueueWaitIdle(vulkan->getVulkanQueue());
+  YabaQueueWaitIdle(vulkan->getVulkanQueue());
   VkDevice device = vulkan->getDevice();
 
   vkDestroySampler(device, offscreenPass.sampler, nullptr);
@@ -175,6 +181,10 @@ void Vdp1Renderer::changeResolution(int width, int height) {
   vkDestroyImageView(device, offscreenPass.depth.view, nullptr);
   vkDestroyFramebuffer(device, offscreenPass.frameBuffer[0], nullptr);
   vkDestroyFramebuffer(device, offscreenPass.frameBuffer[1], nullptr);
+  if (offscreenPass.color[0]._render_complete_semaphore != VK_NULL_HANDLE) vkDestroySemaphore(device, offscreenPass.color[0]._render_complete_semaphore, nullptr);
+  if (offscreenPass.color[1]._render_complete_semaphore != VK_NULL_HANDLE) vkDestroySemaphore(device, offscreenPass.color[1]._render_complete_semaphore, nullptr);
+  offscreenPass.color[0]._render_complete_semaphore = VK_NULL_HANDLE;
+  offscreenPass.color[1]._render_complete_semaphore = VK_NULL_HANDLE;
 
   prepareOffscreen();
 }
@@ -190,6 +200,7 @@ void Vdp1Renderer::prepareOffscreen() {
   // Find a suitable depth format
   VkFormat fbDepthFormat;
   VkBool32 validDepthFormat = vks::tools::getSupportedDepthFormat(physicalDevice, &fbDepthFormat);
+  vdp1DepthFormat = fbDepthFormat;
   assert(validDepthFormat);
 
   // Color attachment
@@ -203,13 +214,16 @@ void Vdp1Renderer::prepareOffscreen() {
   image.arrayLayers = 1;
   image.samples = VK_SAMPLE_COUNT_1_BIT;
   image.tiling = VK_IMAGE_TILING_OPTIMAL;
-  // We will sample directly from the color attachment
-  image.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+  // We will sample directly from the color attachment. TRANSFER_SRC: readFrameBuffer() blits out of it
+  // (VUID-vkCmdBlitImage-srcImage-00219); TRANSFER_DST: blitCpuWrittenFramebuffer() blits into it and
+  // initVdp1Layouts() clears it.
+  image.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
 
   VkMemoryAllocateInfo memAlloc = vks::initializers::memoryAllocateInfo();
   VkMemoryRequirements memReqs;
 
   VK_CHECK_RESULT(vkCreateImage(device, &image, nullptr, &offscreenPass.color[0].image));
+  YABA_VK_NAME(device, VK_OBJECT_TYPE_IMAGE, offscreenPass.color[0].image, "offscreenPass.color[0].image");
   vkGetImageMemoryRequirements(device, offscreenPass.color[0].image, &memReqs);
   memAlloc.allocationSize = memReqs.size;
   //memAlloc.memoryTypeIndex = vulkanDevice->getMemoryType(memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
@@ -229,9 +243,11 @@ void Vdp1Renderer::prepareOffscreen() {
   colorImageView.subresourceRange.layerCount = 1;
   colorImageView.image = offscreenPass.color[0].image;
   VK_CHECK_RESULT(vkCreateImageView(device, &colorImageView, nullptr, &offscreenPass.color[0].view));
+  YABA_VK_NAME(device, VK_OBJECT_TYPE_IMAGE_VIEW, offscreenPass.color[0].view, "offscreenPass.color[0].view");
 
 
   VK_CHECK_RESULT(vkCreateImage(device, &image, nullptr, &offscreenPass.color[1].image));
+  YABA_VK_NAME(device, VK_OBJECT_TYPE_IMAGE, offscreenPass.color[1].image, "offscreenPass.color[1].image");
   vkGetImageMemoryRequirements(device, offscreenPass.color[1].image, &memReqs);
   memAlloc.allocationSize = memReqs.size;
   //memAlloc.memoryTypeIndex = vulkanDevice->getMemoryType(memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
@@ -251,6 +267,7 @@ void Vdp1Renderer::prepareOffscreen() {
   colorImageView.subresourceRange.layerCount = 1;
   colorImageView.image = offscreenPass.color[1].image;
   VK_CHECK_RESULT(vkCreateImageView(device, &colorImageView, nullptr, &offscreenPass.color[1].view));
+  YABA_VK_NAME(device, VK_OBJECT_TYPE_IMAGE_VIEW, offscreenPass.color[1].view, "offscreenPass.color[1].view");
 
 
   // Create sampler to sample from the attachment in the fragment shader
@@ -267,12 +284,14 @@ void Vdp1Renderer::prepareOffscreen() {
   samplerInfo.maxLod = 1.0f;
   samplerInfo.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
   VK_CHECK_RESULT(vkCreateSampler(device, &samplerInfo, nullptr, &offscreenPass.sampler));
+  YABA_VK_NAME(device, VK_OBJECT_TYPE_SAMPLER, offscreenPass.sampler, "offscreenPass.sampler");
 
   // Depth stencil attachment
   image.format = fbDepthFormat;
-  image.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+  image.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT; /* DST: initVdp1Layouts() clears it */
 
   VK_CHECK_RESULT(vkCreateImage(device, &image, nullptr, &offscreenPass.depth.image));
+  YABA_VK_NAME(device, VK_OBJECT_TYPE_IMAGE, offscreenPass.depth.image, "offscreenPass.depth.image");
   vkGetImageMemoryRequirements(device, offscreenPass.depth.image, &memReqs);
   memAlloc.allocationSize = memReqs.size;
   memAlloc.memoryTypeIndex = vulkan->findMemoryType(memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
@@ -291,6 +310,7 @@ void Vdp1Renderer::prepareOffscreen() {
   depthStencilView.subresourceRange.layerCount = 1;
   depthStencilView.image = offscreenPass.depth.image;
   VK_CHECK_RESULT(vkCreateImageView(device, &depthStencilView, nullptr, &offscreenPass.depth.view));
+  YABA_VK_NAME(device, VK_OBJECT_TYPE_IMAGE_VIEW, offscreenPass.depth.view, "offscreenPass.depth.view");
 
   // Create a separate render pass for the offscreen rendering as it may differ from the one used for scene rendering
 
@@ -302,7 +322,10 @@ void Vdp1Renderer::prepareOffscreen() {
   attchmentDescriptions[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
   attchmentDescriptions[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
   attchmentDescriptions[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-  attchmentDescriptions[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  /* LOAD means the previous contents are used, so the real layout must be declared. The framebuffer images
+     are put into this canonical layout once, at creation (initVdp1Layouts), and every pass and every
+     transfer helper below restores it. (Was UNDEFINED + LOAD = "contents garbage" on a tiler: R1.) */
+  attchmentDescriptions[0].initialLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
   attchmentDescriptions[0].finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
   // Depth attachment
   attchmentDescriptions[1].format = fbDepthFormat;
@@ -311,7 +334,7 @@ void Vdp1Renderer::prepareOffscreen() {
   attchmentDescriptions[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
   attchmentDescriptions[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
   attchmentDescriptions[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
-  attchmentDescriptions[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  attchmentDescriptions[1].initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
   attchmentDescriptions[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
   VkAttachmentReference colorReference = { 0, VK_IMAGE_LAYOUT_GENERAL/*VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL*/ };
@@ -328,10 +351,18 @@ void Vdp1Renderer::prepareOffscreen() {
 
   dependencies[0].srcSubpass = VK_SUBPASS_EXTERNAL;
   dependencies[0].dstSubpass = 0;
-  dependencies[0].srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-  dependencies[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-  dependencies[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
-  dependencies[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+  /* Widened (R4): the pass's loadOp LOAD READS the colour attachment and CLEAR/LOAD touch depth/stencil at
+     EARLY_FRAGMENT_TESTS; the old mask only allowed colour WRITE, so the layout transition and the load were
+     unsynchronised (SYNC-HAZARD-READ/WRITE-AFTER-WRITE at vkCmdBeginRenderPass). The src side covers every way
+     the image was last touched: sampled, rendered, or transferred (init clear / blits). */
+  dependencies[0].srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                 VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+  dependencies[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                 VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+  dependencies[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                                  VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+  dependencies[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                                  VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
   dependencies[0].dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
 
   dependencies[1].srcSubpass = 0;
@@ -367,7 +398,12 @@ void Vdp1Renderer::prepareOffscreen() {
   renderPassInfo.dependencyCount = static_cast<uint32_t>(dependencies.size());
   renderPassInfo.pDependencies = dependencies.data();
 
-  VK_CHECK_RESULT(vkCreateRenderPass(device, &renderPassInfo, nullptr, &offscreenPass.renderPass));
+  /* Created once and kept across changeResolution(): it does not depend on the size, the pipeline factory
+     holds the first handle (setRenderPath), and a new pass per call leaked one each time. */
+  if (offscreenPass.renderPass == VK_NULL_HANDLE) {
+    VK_CHECK_RESULT(vkCreateRenderPass(device, &renderPassInfo, nullptr, &offscreenPass.renderPass));
+    YABA_VK_NAME(device, VK_OBJECT_TYPE_RENDER_PASS, offscreenPass.renderPass, "offscreenPass.renderPass");
+  }
 
 
 
@@ -383,6 +419,7 @@ void Vdp1Renderer::prepareOffscreen() {
   fbufCreateInfo.height = offscreenPass.height;
   fbufCreateInfo.layers = 1;
   VK_CHECK_RESULT(vkCreateFramebuffer(device, &fbufCreateInfo, nullptr, &offscreenPass.frameBuffer[0]));
+  YABA_VK_NAME(device, VK_OBJECT_TYPE_FRAMEBUFFER, offscreenPass.frameBuffer[0], "offscreenPass.frameBuffer[0]");
 
 
   attachments[0] = offscreenPass.color[1].view;
@@ -395,6 +432,7 @@ void Vdp1Renderer::prepareOffscreen() {
   fbufCreateInfo.height = offscreenPass.height;
   fbufCreateInfo.layers = 1;
   VK_CHECK_RESULT(vkCreateFramebuffer(device, &fbufCreateInfo, nullptr, &offscreenPass.frameBuffer[1]));
+  YABA_VK_NAME(device, VK_OBJECT_TYPE_FRAMEBUFFER, offscreenPass.frameBuffer[1], "offscreenPass.frameBuffer[1]");
 
   VkSemaphoreCreateInfo semaphore_create_info{};
   semaphore_create_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
@@ -409,6 +447,54 @@ void Vdp1Renderer::prepareOffscreen() {
 
   //vulkan->transitionImageLayout(offscreenPass.color.image, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
+  initVdp1Layouts();
+}
+
+/* Puts the VDP1 framebuffer images into the layout the render pass declares as its initialLayout, with
+   defined contents (cleared). Images are created UNDEFINED; before this, the first frame loaded an
+   UNDEFINED image (R1/R3), which on resolution changes is exactly when artifacts appeared. */
+void Vdp1Renderer::initVdp1Layouts() {
+  VkDevice device = vulkan->getDevice();
+  VkCommandBufferAllocateInfo ai = vks::initializers::commandBufferAllocateInfo(_command_pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1);
+  VkCommandBuffer cb;
+  VK_CHECK_RESULT(vkAllocateCommandBuffers(device, &ai, &cb));
+  VkCommandBufferBeginInfo bi = vks::initializers::commandBufferBeginInfo();
+  VK_CHECK_RESULT(vkBeginCommandBuffer(cb, &bi));
+
+  const VkImageSubresourceRange colorRange{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+  VkImageAspectFlags dsAspect = VK_IMAGE_ASPECT_DEPTH_BIT;
+  if (vdp1DepthFormat == VK_FORMAT_D16_UNORM_S8_UINT || vdp1DepthFormat == VK_FORMAT_D24_UNORM_S8_UINT || vdp1DepthFormat == VK_FORMAT_D32_SFLOAT_S8_UINT)
+    dsAspect |= VK_IMAGE_ASPECT_STENCIL_BIT;
+  const VkImageSubresourceRange dsRange{ dsAspect, 0, 1, 0, 1 };
+
+  VkClearColorValue cc = {};
+  for (int i = 0; i < 2; i++) {
+    vks::tools::insertImageMemoryBarrier(cb, offscreenPass.color[i].image, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+      VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+      VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, colorRange);
+    vkCmdClearColorImage(cb, offscreenPass.color[i].image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &cc, 1, &colorRange);
+    vks::tools::insertImageMemoryBarrier(cb, offscreenPass.color[i].image, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, colorRange);
+  }
+  VkClearDepthStencilValue dc = { 1.0f, 0 };
+  vks::tools::insertImageMemoryBarrier(cb, offscreenPass.depth.image, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+    VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, dsRange);
+  vkCmdClearDepthStencilImage(cb, offscreenPass.depth.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &dc, 1, &dsRange);
+  vks::tools::insertImageMemoryBarrier(cb, offscreenPass.depth.image, VK_ACCESS_TRANSFER_WRITE_BIT,
+    VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, dsRange);
+
+  VK_CHECK_RESULT(vkEndCommandBuffer(cb));
+  VkSubmitInfo si = vks::initializers::submitInfo();
+  si.commandBufferCount = 1;
+  si.pCommandBuffers = &cb;
+  YabaVkSubmit(device, vulkan->getVulkanQueue(), &si, "Vdp1Renderer::initVdp1Layouts");
+  YabaQueueWaitIdle(vulkan->getVulkanQueue());
+  vkFreeCommandBuffers(device, _command_pool, 1, &cb);
+  printf("VDP1LAYOUT: framebuffer images initialised to SHADER_READ_ONLY / DEPTH_STENCIL_ATTACHMENT (%dx%d)\n", offscreenPass.width, offscreenPass.height);
 }
 
 void Vdp1Renderer::createCommandPool() {
@@ -434,7 +520,105 @@ void Vdp1Renderer::createCommandPool() {
 }
 
 
+struct Vdp1PendingLock {
+  pthread_mutex_t * m;
+  explicit Vdp1PendingLock(pthread_mutex_t * mm) : m(mm) { pthread_mutex_lock(m); }
+  ~Vdp1PendingLock() { pthread_mutex_unlock(m); }
+};
+
+static void Vdp1CompleteFences(VkDevice device, VkFence & er, VkFence & off, bool & merge, TextureManager * t, YabaGpuTimer & timer) {
+  if (er != VK_NULL_HANDLE) {
+    YabaVkWaitFence(device, er, "Vdp1Renderer::erase (deferred wait)");
+    er = VK_NULL_HANDLE;
+  }
+  if (off != VK_NULL_HANDLE) {
+    YabaVkWaitFence(device, off, "Vdp1Renderer::drawEnd offscreen (deferred wait)");
+    off = VK_NULL_HANDLE;
+    timer.collect();
+    if (merge) t->endUpdate();   /* the upload that rode in the offscreen submit has run: the staging buffer may be mapped again */
+    merge = false;
+  }
+}
+
+/* Waits for the deferred submits of the CURRENT set only (the one about to be reused). */
+void Vdp1Renderer::completeCurrent() {
+  Vdp1PendingLock lock(&pendingMutex);
+  Vdp1CompleteFences(vulkan->getDevice(), pendingErase, pendingOffscreen, pendingMergeUpload, tm, gpuTimer);
+}
+
+/* Waits for the deferred submits of BOTH sets (CPU-facing framebuffer access, resolution change, shutdown). */
+void Vdp1Renderer::completePending() {
+  Vdp1PendingLock lock(&pendingMutex);
+  Vdp1CompleteFences(vulkan->getDevice(), pendingErase, pendingOffscreen, pendingMergeUpload, tm, gpuTimer);
+  if (vdual) {
+    Vdp1Set & o = vsets[vcur ^ 1];
+    Vdp1CompleteFences(vulkan->getDevice(), o.pendingErase, o.pendingOffscreen, o.pendingMerge, o.tm, o.timer);
+  }
+}
+
+void Vdp1Renderer::saveSet(Vdp1Set & s) {
+  s.tm = tm; s.vm = vm; s.factory = pipleLineFactory;
+  s.pool = _command_pool; s.cbs = _command_buffers; s.curCb = _current_command_buffer;
+  s.uniformBuffer = _uniformBuffer; s.uniformBufferMemory = _uniformBufferMemory;
+  s.pipes = piplelines; s.current = currentPipeLine; s.timer = gpuTimer;
+  s.vertexBuffer = _vertexBuffer; s.vertexBufferMemory = _vertexBufferMemory; s.indexBuffer = _indexBuffer; s.indexBufferMemory = _indexBufferMemory;
+  s.clearUniformBuffer = _clearUniformBuffer; s.clearUniformBufferMemory = _clearUniformBufferMemory;
+  s.descriptorSet = _descriptorSet; s.descriptorSetLayout = _descriptorSetLayout; s.descriptorPool = _descriptorPool;
+  s.vertShaderModule = _vertShaderModule; s.fragShaderModule = _fragShaderModule;
+  s.pipelineLayout = _pipelineLayout; s.graphicsPipeline = _graphicsPipeline;
+  s.pendingOffscreen = pendingOffscreen; s.pendingErase = pendingErase; s.pendingMerge = pendingMergeUpload;
+}
+
+void Vdp1Renderer::loadSet(const Vdp1Set & s) {
+  tm = s.tm; vm = s.vm; pipleLineFactory = s.factory;
+  _command_pool = s.pool; _command_buffers = s.cbs; _current_command_buffer = s.curCb;
+  _uniformBuffer = s.uniformBuffer; _uniformBufferMemory = s.uniformBufferMemory;
+  piplelines = s.pipes; currentPipeLine = s.current; gpuTimer = s.timer;
+  _vertexBuffer = s.vertexBuffer; _vertexBufferMemory = s.vertexBufferMemory; _indexBuffer = s.indexBuffer; _indexBufferMemory = s.indexBufferMemory;
+  _clearUniformBuffer = s.clearUniformBuffer; _clearUniformBufferMemory = s.clearUniformBufferMemory;
+  _descriptorSet = s.descriptorSet; _descriptorSetLayout = s.descriptorSetLayout; _descriptorPool = s.descriptorPool;
+  _vertShaderModule = s.vertShaderModule; _fragShaderModule = s.fragShaderModule;
+  _pipelineLayout = s.pipelineLayout; _graphicsPipeline = s.graphicsPipeline;
+  pendingOffscreen = s.pendingOffscreen; pendingErase = s.pendingErase; pendingMergeUpload = s.pendingMerge;
+}
+
+/* The second set: everything setUp() creates per frame, except the offscreen images and render pass, which are shared. */
+void Vdp1Renderer::createAltSet() {
+  saveSet(vsets[0]);
+  pipleLineFactory = new VdpPipelineFactory();
+  _command_pool = VK_NULL_HANDLE; _command_buffers.clear(); _current_command_buffer = 0;
+  createCommandPool();
+  createUniformBuffer();
+  gpuTimer = YabaGpuTimer();
+  gpuTimer.init(vulkan->getDevice(), vulkan->getPhysicalDevice(), vulkan->getVulkanQueue(), vulkan->getVulkanGraphicsQueueFamilyIndex(), "vdp1");
+  tm = new TextureManager(vulkan);
+  tm->init(512, 512);
+  vm = new VertexManager(vulkan);
+  vm->init(1024 * 128, 1024 * 128);
+  genClearPipeline();
+  pipleLineFactory->setRenderPath(offscreenPass.renderPass);
+  piplelines.clear(); currentPipeLine = nullptr;
+  pendingOffscreen = VK_NULL_HANDLE; pendingErase = VK_NULL_HANDLE; pendingMergeUpload = false;
+  saveSet(vsets[1]);
+  loadSet(vsets[0]);
+  vcur = 0;
+  vdual = true;
+  fprintf(stderr, "VDP1SETS: two sets of per-frame VDP1 resources, used alternately\n");
+  fflush(stderr);
+}
+
+void Vdp1Renderer::selectNextSet() {
+  if (!vdual) return;
+  saveSet(vsets[vcur]);
+  vcur ^= 1;
+  loadSet(vsets[vcur]);
+}
+
 void Vdp1Renderer::drawStart(void) {
+
+  selectNextSet();     /* two sets: the CPU works in the set the GPU has not touched for a frame */
+  { const long long _w0 = PerfNowNs(); completeCurrent(); PerfAddVk(16, PerfNowNs() - _w0); }
+  //   /* this set's previous frame (two frames ago) must be finished before its pool, buffers and atlas are reused */
 
   int i;
   int maxpri;
@@ -492,6 +676,7 @@ void Vdp1Renderer::drawStart(void) {
 void Vdp1Renderer::erase() {
 
   VkDevice device = vulkan->getDevice();
+  if (deferVdp1 && pendingErase != VK_NULL_HANDLE) completeCurrent();   /* its uniform buffer is rewritten below */
 
   u16 color;
   int priority;
@@ -587,7 +772,7 @@ void Vdp1Renderer::erase() {
   VkCommandBuffer cb = getNextCommandBuffer();
 
   VkCommandBufferBeginInfo cmdBufInfo = vks::initializers::commandBufferBeginInfo();
-  //vkQueueWaitIdle(vulkan->getVulkanQueue());
+  //YabaQueueWaitIdle(vulkan->getVulkanQueue());
   vkBeginCommandBuffer(cb, &cmdBufInfo);
   vkCmdBeginRenderPass(cb, &renderPassBeginInfo, VK_SUBPASS_CONTENTS_INLINE);
 
@@ -625,8 +810,14 @@ void Vdp1Renderer::erase() {
   submit_info.pWaitDstStageMask = nullptr;
   submit_info.commandBufferCount = 1;
   submit_info.pCommandBuffers = &cb;
-  vkQueueSubmit(vulkan->getVulkanQueue(), 1, &submit_info, VK_NULL_HANDLE);
-  //vkQueueWaitIdle(vulkan->getVulkanQueue());
+  if (deferVdp1) {
+    Vdp1PendingLock lock(&pendingMutex);
+    YabaVkSubmitAsync(vulkan->getDevice(), vulkan->getVulkanQueue(), &submit_info, "Vdp1Renderer::erase", &pendingErase);
+  } else {
+    YabaVkSubmit(vulkan->getDevice(), vulkan->getVulkanQueue(), &submit_info,
+                 "Vdp1Renderer::erase");
+  }
+  //YabaQueueWaitIdle(vulkan->getVulkanQueue());
   //vkDeviceWaitIdle(device);
 }
 
@@ -647,6 +838,8 @@ void Vdp1Renderer::drawEnd(void) {
     int fi = drawframe;
     return;
   }
+
+  if (deferVdp1) completeCurrent();   /* a second drawEnd without a drawStart in between: the previous one must be finished first */
 
   vdp1Ubo ubo = {};
   glm::mat4 m4(1.0f);
@@ -671,9 +864,14 @@ void Vdp1Renderer::drawEnd(void) {
     piplelines[i]->setSampler(VdpPipeline::bindIdFbo, offscreenPass.color[drawframe].view, offscreenPass.sampler);
   }
 
-  tm->updateTextureImage([&](VkCommandBuffer commandBuffer) {
-    vm->flush(commandBuffer);
-  });
+  const bool mergeUpload = YabaMergeSubmits() != 0;
+  if (mergeUpload) {
+    tm->beginUpdate();   /* the upload is recorded into the offscreen command buffer below */
+  } else {
+    tm->updateTextureImage([&](VkCommandBuffer commandBuffer) {
+      vm->flush(commandBuffer);
+    });
+  }
 
   VkClearValue clearValues[2];
   clearValues[0].color = { { 0.0f, 0.0f, 0.0f, 0.0f } };
@@ -694,7 +892,13 @@ void Vdp1Renderer::drawEnd(void) {
 
   VkCommandBufferBeginInfo cmdBufInfo = vks::initializers::commandBufferBeginInfo();
   vkBeginCommandBuffer(cb, &cmdBufInfo);
+  gpuTimer.begin(cb);
 
+  if (mergeUpload) {
+    tm->recordUpdate(cb);
+    vm->flush(cb);
+  }
+  gpuTimer.mark(cb, "upload");
   //tm->updateTextureImage();
 
   vkCmdBeginRenderPass(cb, &renderPassBeginInfo, VK_SUBPASS_CONTENTS_INLINE);
@@ -773,6 +977,7 @@ void Vdp1Renderer::drawEnd(void) {
     }
   }
   vkCmdEndRenderPass(cb);
+  gpuTimer.mark(cb, "pass");
 
 
   vkEndCommandBuffer(cb);
@@ -797,11 +1002,20 @@ void Vdp1Renderer::drawEnd(void) {
   submit_info.pCommandBuffers = &cb;
   submit_info.signalSemaphoreCount = 0; //1;
   submit_info.pSignalSemaphores = nullptr; // &offscreenPass.color[fi]._render_complete_semaphore;
-  vkQueueSubmit(vulkan->getVulkanQueue(), 1, &submit_info, VK_NULL_HANDLE);
+  if (deferVdp1) {
+    Vdp1PendingLock lock(&pendingMutex);
+    pendingMergeUpload = mergeUpload;
+    YabaVkSubmitAsync(vulkan->getDevice(), vulkan->getVulkanQueue(), &submit_info, "Vdp1Renderer::drawEnd offscreen", &pendingOffscreen);
+  } else {
+    YabaVkSubmit(vulkan->getDevice(), vulkan->getVulkanQueue(), &submit_info,
+                 "Vdp1Renderer::drawEnd offscreen");
+    gpuTimer.collect();
+    if (mergeUpload) tm->endUpdate();   /* the submit has completed (fence), the CPU may write the staging buffer again */
+  }
   offscreenPass.color[drawframe].updated = true;
   offscreenPass.color[drawframe].readed = false;
 
-  //vkQueueWaitIdle(vulkan->getVulkanQueue());
+  //YabaQueueWaitIdle(vulkan->getVulkanQueue());
   //vkDeviceWaitIdle(device);
 
   //transitionImageLayout(offscreenPass.color.image, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
@@ -953,6 +1167,7 @@ void Vdp1Renderer::NormalSpriteDraw(u8 * ram, Vdp1 * regs, u8 * back_framebuffer
 
     if (sprite.w > 0 && sprite.h > 0)
     {
+      g_ts_unit = 1;
       if (tm->isCached(tmp, &cash)) {
         genPolygon(&sprite, NULL, col, &cash, 0);
         return;
@@ -968,6 +1183,7 @@ void Vdp1Renderer::NormalSpriteDraw(u8 * ram, Vdp1 * regs, u8 * back_framebuffer
   {
     if (sprite.w > 0 && sprite.h > 0)
     {
+      g_ts_unit = 1;
       if (tm->isCached(tmp, &cash)) {
         genPolygon(&sprite, NULL, NULL, &cash, 0);
         return;
@@ -1163,6 +1379,8 @@ void Vdp1Renderer::ScaledSpriteDraw(u8 * ram, Vdp1 * regs, u8 * back_framebuffer
     if (sprite.w > 0 && sprite.h > 0)
     {
 
+      g_ts_unit = 1;
+
       if (tm->isCached(tmp, &cash)) {
         genPolygon(&sprite, NULL, col, &cash, 0);
         return;
@@ -1192,6 +1410,8 @@ void Vdp1Renderer::ScaledSpriteDraw(u8 * ram, Vdp1 * regs, u8 * back_framebuffer
 
     if (sprite.w > 0 && sprite.h > 0)
     {
+
+      g_ts_unit = 1;
 
       if (tm->isCached(tmp, &cash)) {
         genPolygon(&sprite, NULL, NULL, &cash, 0);
@@ -1434,6 +1654,8 @@ void Vdp1Renderer::DistortedSpriteDraw(u8 * ram, Vdp1 * regs, u8 * back_framebuf
       col[(i << 2) + 3] = 1.0f;
     }
 
+    g_ts_unit = 1;
+
     if (tm->isCached(tmp, &cash)) {
       genPolygon(&sprite, NULL, col, &cash, 0);
       return;
@@ -1445,6 +1667,7 @@ void Vdp1Renderer::DistortedSpriteDraw(u8 * ram, Vdp1 * regs, u8 * back_framebuf
   }
   else // No Gouraud shading, use same color for all 4 vertices
   {
+    g_ts_unit = 1;
     if (tm->isCached(tmp, &cash)) {
       genPolygon(&sprite, NULL, NULL, &cash, 0);
       return;
@@ -1915,13 +2138,17 @@ void Vdp1Renderer::genClearPipeline() {
 
   Compiler compiler;
   CompileOptions options;
+  /* Modern shaderc/glslang (Debian 2025.2 here, vs the old Android NDK copy
+     this code was written against) will not build its built-in symbol table
+     without a target environment: it falls back to profile "none" and dies
+     with "'double' : not supported with this profile: none / INTERNAL ERROR:
+     Unable to parse built-ins", reporting ZERO errors while emitting no
+     SPIR-V, so vkCreateShaderModule then fails. */
+  options.SetTargetEnvironment(shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_1);
+  options.SetTargetSpirv(shaderc_spirv_version_1_3);
   options.SetOptimizationLevel(shaderc_optimization_level_performance);
 
-  SpvCompilationResult result = compiler.CompileGlslToSpv(
-    get_shader_header() + vertexShaderName,
-    shaderc_vertex_shader,
-    "clear vertex",
-    options);
+  YabaSpvResult result = YabaCompileGlslCached(compiler, get_shader_header() + vertexShaderName, shaderc_vertex_shader, "clear vertex", options, "vk11-spv13-perf");
 
   std::cout << " erros: " << result.GetNumErrors() << std::endl;
   if (result.GetNumErrors() != 0) {
@@ -1938,11 +2165,7 @@ void Vdp1Renderer::genClearPipeline() {
     throw std::runtime_error("failed to create shader module!");
   }
 
-  result = compiler.CompileGlslToSpv(
-    get_shader_header() + fragmentShaderName,
-    shaderc_fragment_shader,
-    "clear fragment",
-    options);
+  result = YabaCompileGlslCached(compiler, get_shader_header() + fragmentShaderName, shaderc_fragment_shader, "clear fragment", options, "vk11-spv13-perf");
 
   std::cout << " erros: " << result.GetNumErrors() << std::endl;
   if (result.GetNumErrors() != 0) {
@@ -2154,6 +2377,7 @@ void Vdp1Renderer::genClearPipeline() {
   if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &_graphicsPipeline) != VK_SUCCESS) {
     throw std::runtime_error("failed to create graphics pipeline!");
   }
+  YABA_VK_NAME(device, VK_OBJECT_TYPE_PIPELINE, _graphicsPipeline, "_graphicsPipeline");
 
 
 }
@@ -3718,6 +3942,8 @@ extern "C" {
 
 void Vdp1Renderer::readFrameBuffer(u32 type, u32 addr, void * out) {
 
+  if (deferVdp1) completePending();
+
   u32 x = 0;
   u32 y = 0;
   int tvmode = (Vdp1Regs->TVMR & 0x7);
@@ -3823,6 +4049,7 @@ void Vdp1Renderer::readFrameBuffer(u32 type, u32 addr, void * out) {
 
         // Create the image
         VK_CHECK_RESULT(vkCreateImage(device, &imageCreateCI, nullptr, &dstDeviceImage));
+  YABA_VK_NAME(device, VK_OBJECT_TYPE_IMAGE, dstDeviceImage, "dstDeviceImage");
         // Create memory to back up the image
         VkMemoryRequirements memRequirements;
         VkMemoryAllocateInfo memAllocInfo(vks::initializers::memoryAllocateInfo());
@@ -3852,6 +4079,7 @@ void Vdp1Renderer::readFrameBuffer(u32 type, u32 addr, void * out) {
 
       // Create the image
       VK_CHECK_RESULT(vkCreateImage(device, &imageCreateCI, nullptr, &dstImage));
+  YABA_VK_NAME(device, VK_OBJECT_TYPE_IMAGE, dstImage, "dstImage");
       // Create memory to back up the image
       VkMemoryRequirements memRequirements;
       VkMemoryAllocateInfo memAllocInfo(vks::initializers::memoryAllocateInfo());
@@ -3886,15 +4114,16 @@ void Vdp1Renderer::readFrameBuffer(u32 type, u32 addr, void * out) {
       VK_PIPELINE_STAGE_TRANSFER_BIT,
       VkImageSubresourceRange{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 });
 
-    // Transition swapchain image from present to transfer source layout
+    // The VDP1 colour image is a render target: its pass leaves it in SHADER_READ_ONLY_OPTIMAL (was
+    // PRESENT_SRC_KHR, copied from the swapchain screenshot code). It is put back after the blit.
     vks::tools::insertImageMemoryBarrier(
       cmdBuffer,
       srcImage,
-      VK_ACCESS_MEMORY_READ_BIT,
+      VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
       VK_ACCESS_TRANSFER_READ_BIT,
-      VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
       VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-      VK_PIPELINE_STAGE_TRANSFER_BIT,
+      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
       VK_PIPELINE_STAGE_TRANSFER_BIT,
       VkImageSubresourceRange{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 });
 
@@ -3920,6 +4149,18 @@ void Vdp1Renderer::readFrameBuffer(u32 type, u32 addr, void * out) {
       &imageBlitRegion,
       VK_FILTER_NEAREST);
 
+    // The VDP1 image goes back to the layout the next pass declares as its initialLayout.
+    vks::tools::insertImageMemoryBarrier(
+      cmdBuffer,
+      srcImage,
+      VK_ACCESS_TRANSFER_READ_BIT,
+      VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+      VK_PIPELINE_STAGE_TRANSFER_BIT,
+      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+      VkImageSubresourceRange{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 });
+
     // Transition destination image to transfer destination layout
     vks::tools::insertImageMemoryBarrier(
       cmdBuffer,
@@ -3932,13 +4173,13 @@ void Vdp1Renderer::readFrameBuffer(u32 type, u32 addr, void * out) {
       VK_PIPELINE_STAGE_TRANSFER_BIT,
       VkImageSubresourceRange{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 });
 
-    // Transition swapchain image from present to transfer source layout
+    // dstDeviceImage was just written by the blit (TRANSFER_DST), now it is the copy source.
     vks::tools::insertImageMemoryBarrier(
       cmdBuffer,
       dstDeviceImage,
-      VK_ACCESS_MEMORY_READ_BIT,
+      VK_ACCESS_TRANSFER_WRITE_BIT,
       VK_ACCESS_TRANSFER_READ_BIT,
-      VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
       VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
       VK_PIPELINE_STAGE_TRANSFER_BIT,
       VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -3962,6 +4203,17 @@ void Vdp1Renderer::readFrameBuffer(u32 type, u32 addr, void * out) {
       1,
       &imageCopyRegion);
 
+    vks::tools::insertImageMemoryBarrier(
+      cmdBuffer,
+      dstImage,
+      VK_ACCESS_TRANSFER_WRITE_BIT,
+      VK_ACCESS_HOST_READ_BIT,
+      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+      VK_IMAGE_LAYOUT_GENERAL,
+      VK_PIPELINE_STAGE_TRANSFER_BIT,
+      VK_PIPELINE_STAGE_HOST_BIT,
+      VkImageSubresourceRange{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 });
+
     VK_CHECK_RESULT(vkEndCommandBuffer(cmdBuffer));
 
     VkSubmitInfo submitInfo = vks::initializers::submitInfo();
@@ -3972,7 +4224,7 @@ void Vdp1Renderer::readFrameBuffer(u32 type, u32 addr, void * out) {
     VkFence fence;
     VK_CHECK_RESULT(vkCreateFence(device, &fenceInfo, nullptr, &fence));
     // Submit to the queue
-    VK_CHECK_RESULT(vkQueueSubmit(vulkan->getVulkanQueue(), 1, &submitInfo, fence));
+    VK_CHECK_RESULT(YabaQueueSubmit(vulkan->getVulkanQueue(), 1, &submitInfo, fence));
     // Wait for the fence to signal that command buffer has finished executing
     VK_CHECK_RESULT(vkWaitForFences(device, 1, &fence, VK_TRUE, DEFAULT_FENCE_TIMEOUT));
     vkDestroyFence(device, fence, nullptr);
@@ -4062,6 +4314,7 @@ void Vdp1Renderer::blitCpuWrittenFramebuffer(int target) {
 
 
   VkImage dstImage = offscreenPass.color[target].image;
+  bool writeImageFresh = false;   // created in this call: its layout is PREINITIALIZED, later calls find it in TRANSFER_SRC
   if (writeImage == VK_NULL_HANDLE || writeWidth < Vdp1Regs->systemclipX2 + 1 || writeHeight < Vdp1Regs->systemclipY2 + 1) {
 
 
@@ -4102,6 +4355,7 @@ void Vdp1Renderer::blitCpuWrittenFramebuffer(int target) {
 
       // Create the image
       VK_CHECK_RESULT(vkCreateImage(device, &imageCreateCI, nullptr, &writeDeviceImage));
+  YABA_VK_NAME(device, VK_OBJECT_TYPE_IMAGE, writeDeviceImage, "writeDeviceImage");
       // Create memory to back up the image
       VkMemoryRequirements memRequirements;
       VkMemoryAllocateInfo memAllocInfo(vks::initializers::memoryAllocateInfo());
@@ -4125,13 +4379,15 @@ void Vdp1Renderer::blitCpuWrittenFramebuffer(int target) {
       imageCreateCI.extent.depth = 1;
       imageCreateCI.arrayLayers = 1;
       imageCreateCI.mipLevels = 1;
-      imageCreateCI.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+      imageCreateCI.initialLayout = VK_IMAGE_LAYOUT_PREINITIALIZED;   // host writes the texels before the first use
       imageCreateCI.samples = VK_SAMPLE_COUNT_1_BIT;
       imageCreateCI.tiling = VK_IMAGE_TILING_LINEAR;
       imageCreateCI.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+      writeImageFresh = true;
 
       // Create the image
       VK_CHECK_RESULT(vkCreateImage(device, &imageCreateCI, nullptr, &writeImage));
+  YABA_VK_NAME(device, VK_OBJECT_TYPE_IMAGE, writeImage, "writeImage");
       // Create memory to back up the image
       VkMemoryRequirements memRequirements;
       VkMemoryAllocateInfo memAllocInfo(vks::initializers::memoryAllocateInfo());
@@ -4170,28 +4426,27 @@ void Vdp1Renderer::blitCpuWrittenFramebuffer(int target) {
   VkCommandBufferBeginInfo cmdBufInfo = vks::initializers::commandBufferBeginInfo();
   VK_CHECK_RESULT(vkBeginCommandBuffer(cmdBuffer, &cmdBufInfo));
 
-  // Transition destination image to transfer destination layout
+  // dst = the VDP1 colour image (canonical SHADER_READ_ONLY_OPTIMAL; the blit covers all of it but the
+  // contents are kept anyway). src = writeImage, host-written linear image.
   vks::tools::insertImageMemoryBarrier(
     cmdBuffer,
     dstImage,
-    0,
+    VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
     VK_ACCESS_TRANSFER_WRITE_BIT,
-    VK_IMAGE_LAYOUT_UNDEFINED,
+    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-    VK_PIPELINE_STAGE_TRANSFER_BIT,
+    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
     VK_PIPELINE_STAGE_TRANSFER_BIT,
     VkImageSubresourceRange{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 });
 
-
-  // Transition swapchain image from present to transfer source layout
   vks::tools::insertImageMemoryBarrier(
     cmdBuffer,
     writeImage,
-    VK_ACCESS_MEMORY_READ_BIT,
+    VK_ACCESS_HOST_WRITE_BIT,
     VK_ACCESS_TRANSFER_READ_BIT,
-    VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+    writeImageFresh ? VK_IMAGE_LAYOUT_PREINITIALIZED : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-    VK_PIPELINE_STAGE_TRANSFER_BIT,
+    VK_PIPELINE_STAGE_HOST_BIT,
     VK_PIPELINE_STAGE_TRANSFER_BIT,
     VkImageSubresourceRange{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 });
 
@@ -4199,8 +4454,10 @@ void Vdp1Renderer::blitCpuWrittenFramebuffer(int target) {
   VkImageBlit imageBlitRegion{};
   imageBlitRegion.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
   imageBlitRegion.srcSubresource.layerCount = 1;
-  imageBlitRegion.srcOffsets[1].x = writeWidth * ((float)vdp2Width / (float)writeWidth);
-  imageBlitRegion.srcOffsets[1].y = writeHeight * ((float)vdp2Height / (float)writeHeight);
+  /* = vdp2Width x vdp2Height, but a blit source region must lie inside the source image (VUID-vkCmdBlitImage-srcOffset-00244 /
+     pRegions-00215): Daytona has a 224-line VDP2 screen and a 216-line VDP1 system clip. Clamp to the image. */
+  imageBlitRegion.srcOffsets[1].x = std::min<int>((int)writeWidth, (int)(writeWidth * ((float)vdp2Width / (float)writeWidth)));
+  imageBlitRegion.srcOffsets[1].y = std::min<int>((int)writeHeight, (int)(writeHeight * ((float)vdp2Height / (float)writeHeight)));
   imageBlitRegion.srcOffsets[1].z = 1;
   imageBlitRegion.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
   imageBlitRegion.dstSubresource.layerCount = 1;
@@ -4217,6 +4474,18 @@ void Vdp1Renderer::blitCpuWrittenFramebuffer(int target) {
     &imageBlitRegion,
     VK_FILTER_NEAREST);
 
+  // back to the canonical layout the next VDP1 pass expects
+  vks::tools::insertImageMemoryBarrier(
+    cmdBuffer,
+    dstImage,
+    VK_ACCESS_TRANSFER_WRITE_BIT,
+    VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+    VK_PIPELINE_STAGE_TRANSFER_BIT,
+    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+    VkImageSubresourceRange{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 });
+
   VK_CHECK_RESULT(vkEndCommandBuffer(cmdBuffer));
 
   VkSubmitInfo submitInfo = vks::initializers::submitInfo();
@@ -4227,7 +4496,7 @@ void Vdp1Renderer::blitCpuWrittenFramebuffer(int target) {
   VkFence fence;
   VK_CHECK_RESULT(vkCreateFence(device, &fenceInfo, nullptr, &fence));
   // Submit to the queue
-  VK_CHECK_RESULT(vkQueueSubmit(vulkan->getVulkanQueue(), 1, &submitInfo, fence));
+  VK_CHECK_RESULT(YabaQueueSubmit(vulkan->getVulkanQueue(), 1, &submitInfo, fence));
   // Wait for the fence to signal that command buffer has finished executing
   VK_CHECK_RESULT(vkWaitForFences(device, 1, &fence, VK_TRUE, DEFAULT_FENCE_TIMEOUT));
   vkDestroyFence(device, fence, nullptr);
@@ -4237,6 +4506,7 @@ void Vdp1Renderer::blitCpuWrittenFramebuffer(int target) {
 
 
 void Vdp1Renderer::writeFrameBuffer(u32 type, u32 addr, u32 val) {
+  if (deferVdp1) completePending();
   switch (type)
   {
   case 0:

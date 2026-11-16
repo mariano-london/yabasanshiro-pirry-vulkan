@@ -19,6 +19,7 @@ along with YabaSanshiro; if not, write to the Free Software
 Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 */
 
+#include "ZeroAlloc.h"
 #include "ygl.h"
 #include "VulkanScene.h"
 
@@ -31,6 +32,9 @@ class TextureManager;
 class VertexManager;
 
 class VdpPipelineFactory {
+public:
+  YABA_ZERO_NEW
+private:
 public:
   VdpPipelineFactory();
   ~VdpPipelineFactory();

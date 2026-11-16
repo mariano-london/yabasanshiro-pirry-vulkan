@@ -31,6 +31,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 
 #pragma once
 
+#include "ZeroAlloc.h"
 #include "Platform.h"
 
 #include <vector>
@@ -41,6 +42,9 @@ class Renderer;
 class Window
 {
 public:
+  YABA_ZERO_NEW
+private:
+public:
   Window(Renderer * renderer, uint32_t size_x, uint32_t size_y, std::string name, void * nativeWindow);
   ~Window();
 
@@ -49,6 +53,7 @@ public:
 
   int								BeginRender();
   void								EndRender(std::vector<VkSemaphore> wait_semaphores);
+  void								RecordPresentTransition(VkCommandBuffer cmd);
 
   VkRenderPass	 GetVulkanRenderPass();
   VkRenderPass   GetVulkanKeepRenderPass();
@@ -71,8 +76,12 @@ public:
   ANativeWindow*             window;
 #else
   void setNativeWindow(void * nativeWindow) { }
+#if BUILD_USE_GLFW
+  /* Only meaningful on the GLFW backend; the SDL and VK_KHR_display backends
+     have no GLFWwindow type available at all. */
   GLFWwindow * getWindowHandle() { return _glfw_window; }
-#endif  
+#endif
+#endif
 
   void resize(int width, int height);
   void cleanupSwapChain();
@@ -134,6 +143,20 @@ private:
   bool								_stencil_available = false;
 
   bool								_window_should_run = true;
+
+  /* Frame dump (instrumentation, off unless YABA_VK_FRAMEDUMP=N is set):
+     writes every Nth presented frame as a PPM into YABA_VK_FRAMEDUMP_DIR. */
+  int								_fd_every = 0;
+  bool								_fd_usage_ok = false;
+  uint64_t							_fd_frame = 0;
+  VkCommandPool						_fd_pool = VK_NULL_HANDLE;
+  VkBuffer							_fd_buf = VK_NULL_HANDLE;
+  VkDeviceMemory					_fd_mem = VK_NULL_HANDLE;
+  VkSemaphore						_fd_sem = VK_NULL_HANDLE;
+  VkFence							_fd_fence = VK_NULL_HANDLE;
+  VkDeviceSize						_fd_size = 0;
+  bool								_DumpFrame(const std::vector<VkSemaphore> & wait_semaphores);
+  void								_DeInitFrameDump();
 
 
 #if USE_FRAMEWORK_GLFW

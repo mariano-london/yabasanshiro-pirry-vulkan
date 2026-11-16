@@ -19,6 +19,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 */
 #pragma once
 
+#include "ZeroAlloc.h"
 #include "Renderer.h"
 
 #define GLM_FORCE_RADIANS
@@ -85,6 +86,9 @@ struct Vertex {
 
 class VulkanScene
 {
+public:
+  YABA_ZERO_NEW
+private:
 public:
   VulkanScene();
   ~VulkanScene();

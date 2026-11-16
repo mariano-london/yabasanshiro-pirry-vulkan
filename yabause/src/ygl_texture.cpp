@@ -35,6 +35,7 @@ extern "C" {
 
 #if defined(HAVE_VULKAN)
 #include "vulkan/VIDVulkan.h"
+#include "vulkan/Shared.h"   /* YabaFlightNote / YabaVkRunFailHook */
 #include "vulkan/vulkan.hpp"
 #endif
 
@@ -263,6 +264,19 @@ const char prg_generate_rbg_base[] =
 
 // Room for the local_size substitutions.
 char prg_generate_rbg[ sizeof(prg_generate_rbg_base) + 256 ] = {};
+
+/* The local workgroup size prg_generate_rbg was actually generated with. The
+   DISPATCH has to use these same numbers: a dispatch computed from a different
+   tile size than the shader declares makes every workgroup past the real
+   extent read the VDP2 SSBO out of bounds, which on Mali is
+   "job status 0x00000058 (DATA_INVALID_FAULT)" from job slot 0 -- the job
+   dies, its fence never signals, and the renderer hangs on the first frame.
+   The OpenGL path already does this correctly (see work_groups_x/y in
+   RBGGenerator::update, computed from its own local_size_x/y members); the
+   Vulkan path had a hardcoded "/ 16" instead. Defaults match the 16x16 the
+   shader source was written for. */
+int prg_generate_rbg_local_x = 16;
+int prg_generate_rbg_local_y = 16;
 
 const char prg_rbg_rpmd0_2w[] =
 "  paramid = 0; \n"
@@ -2681,6 +2695,19 @@ public:
 #if defined(HAVE_VULKAN)
 
 #include "vulkan/RBGGeneratorVulkan.h"
+#include "vulkan/ShaderCache.h"
+
+/* Also declared in vulkan/Shared.h (forward-declared, like YabaVkSubmit below, to keep that header out of this unit). */
+void YabaVkName(VkDevice device, VkObjectType type, uint64_t handle, const char * name);
+void YabaVkInitColorImage(VkDevice device, VkQueue queue, uint32_t queueFamily, VkImage image,
+                          VkImageLayout finalLayout, VkAccessFlags dstAccess, VkPipelineStageFlags dstStage);
+
+/* Declared in vulkan/Shared.h; forward-declared here so this translation unit
+   does not have to pull that header in. Traces each queue submit and, unless
+   YABA_VK_SYNC=0, waits on a fence after it, so a job the GPU kills is named
+   in the log instead of silently wedging the queue. */
+void YabaVkSubmit(VkDevice device, VkQueue queue,
+                  const VkSubmitInfo * submit_info, const char * tag);
 #include <iostream>
 
 #define VK_CHECK_RESULT(f)																				\
@@ -2712,6 +2739,47 @@ RBGGeneratorVulkan::~RBGGeneratorVulkan() {
 void RBGGeneratorVulkan::init(VIDVulkan * vulkan, int width, int height) {
 
   this->vulkan = vulkan;
+
+  /* prg_generate_rbg is a zero-initialised buffer (see its definition above);
+     the ONLY code that fills it from prg_generate_rbg_base -- which is where
+     the "#version" directive and the local_size layout live -- sits in the
+     OpenGL init path, which a Vulkan build never runs. It therefore stayed an
+     empty string, the concatenated compute shader began with no #version,
+     glslang fell back to version 110 / profile "none", failed to parse its own
+     built-ins on 'double', emitted no SPIR-V while reporting zero errors, and
+     vkCreateShaderModule then threw "failed to create shader module!".
+     Populate it here, before either compute shader is assembled. */
+  if (prg_generate_rbg[0] == '\0') {
+    VkPhysicalDeviceProperties props = {};
+    vkGetPhysicalDeviceProperties(vulkan->getPhysicalDevice(), &props);
+    uint32_t maxInv = props.limits.maxComputeWorkGroupInvocations;
+    if (maxInv < 1) maxInv = 128;   /* Vulkan's guaranteed floor */
+
+    /* 16x16 is what the shader body was written for, and the dispatch below
+       then divides the texture evenly. Only shrink -- never grow past 16 to
+       "use up" maxInvocations, which is what produced a 16x24 shader against
+       a /16 dispatch and faulted the GPU on the first frame. */
+    int lsx = 16;
+    int lsy = 16;
+    uint32_t maxX = props.limits.maxComputeWorkGroupSize[0];
+    uint32_t maxY = props.limits.maxComputeWorkGroupSize[1];
+    if (maxX > 0) while (lsx > (int)maxX) lsx >>= 1;
+    if (maxY > 0) while (lsy > (int)maxY) lsy >>= 1;
+    while (lsx * lsy > (int)maxInv && lsy > 1) lsy >>= 1;
+    while (lsx * lsy > (int)maxInv && lsx > 1) lsx >>= 1;
+    if (lsx < 1) lsx = 1;
+    if (lsy < 1) lsy = 1;
+
+    prg_generate_rbg_local_x = lsx;
+    prg_generate_rbg_local_y = lsy;
+    fprintf(stderr, "RBG compute local_size = %dx%d (maxInvocations=%u, "
+                    "maxWorkGroupSize=%ux%u)\n",
+            lsx, lsy, maxInv, maxX, maxY);
+    fflush(stderr);
+    snprintf(prg_generate_rbg, sizeof(prg_generate_rbg),
+             prg_generate_rbg_base, lsx, lsy);
+  }
+
   VkDevice device = vulkan->getDevice();
   vk::Device d(device);
   resize(width,height);
@@ -2817,11 +2885,7 @@ void RBGGeneratorVulkan::init(VIDVulkan * vulkan, int width, int height) {
   Compiler compiler;
   CompileOptions options;
   options.SetOptimizationLevel(shaderc_optimization_level_performance);
-  SpvCompilationResult result = compiler.CompileGlslToSpv(
-    target,
-    shaderc_compute_shader,
-    "a_prg_rbg_0_2w_bitmap",
-    options);
+  YabaSpvResult result = YabaCompileGlslCached(compiler, target, shaderc_compute_shader, "a_prg_rbg_0_2w_bitmap", options, "default-perf");
 
   printf("%s%d\n", " erros: ", (int)result.GetNumErrors());
   if (result.GetNumErrors() != 0) {
@@ -2930,6 +2994,16 @@ void RBGGeneratorVulkan::resize(int width, int height) {
   tex_width_ = width;
   tex_height_ = height;
 
+  /* Wait before destroying: these resources may still be bound by command
+     buffers submitted for earlier frames. Destroying them under an in-flight
+     job is a use-after-free on the device -- Mali reports
+     "DATA_INVALID_FAULT from job slot 0" and then loses the device. The
+     sibling paths (Vdp1Renderer/WindowRenderer::changeResolution,
+     VIDVulkan::freeSubRenderTarget, TextureManager's destructor) all do this.
+     Called at runtime from the rebuildFrameBuffer path in
+     VIDVulkan::Vdp2DrawStart, i.e. on every resolution or mode change. */
+  YabaQueueWaitIdle(vulkan->getVulkanQueue());
+
   if (tex_surface[0].image) d.destroyImage(tex_surface[0].image);
   if (tex_surface[0].view) d.destroyImageView(tex_surface[0].view);
   if (tex_surface[0].mem) d.freeMemory(tex_surface[0].mem);
@@ -2947,11 +3021,18 @@ void RBGGeneratorVulkan::resize(int width, int height) {
   imageCreateInfo.mipLevels = 1;
   imageCreateInfo.arrayLayers = 1;
   imageCreateInfo.tiling = vk::ImageTiling::eOptimal;
-  imageCreateInfo.usage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eStorage;
-  imageCreateInfo.sharingMode = vk::SharingMode::eConcurrent;
-  imageCreateInfo.queueFamilyIndexCount = 2;
+  imageCreateInfo.usage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferDst;
+  /* CONCURRENT needs two DISTINCT families (VUID-VkImageCreateInfo-sharingMode-01420).
+     On a GPU whose graphics and compute family are the same (Mali, lavapipe) the
+     indices were identical, and queueFamilyIndexCount was set without being valid. */
   uint32_t indexes[] = { vulkan->getVulkanGraphicsQueueFamilyIndex(),vulkan->getVulkanComputeQueueFamilyIndex() };
-  imageCreateInfo.pQueueFamilyIndices = indexes;
+  if (indexes[0] != indexes[1]) {
+    imageCreateInfo.sharingMode = vk::SharingMode::eConcurrent;
+    imageCreateInfo.queueFamilyIndexCount = 2;
+    imageCreateInfo.pQueueFamilyIndices = indexes;
+  } else {
+    imageCreateInfo.sharingMode = vk::SharingMode::eExclusive;
+  }
 
   for (int i = 0; i < 2; i++) {
     VK_CHECK_RESULT(d.createImage(&imageCreateInfo, nullptr, &tex_surface[i].image));
@@ -2972,7 +3053,14 @@ void RBGGeneratorVulkan::resize(int width, int height) {
     view.image = tex_surface[i].image;
     tex_surface[i].view = d.createImageView(view);
 
-    vulkan->transitionImageLayout(VkImage(tex_surface[i].image), VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    YabaVkName((VkDevice)d, VK_OBJECT_TYPE_IMAGE, (uint64_t)(VkImage)tex_surface[i].image, "rbg_tex_surface @ ygl_texture.cpp");
+    /* Resting layout is SHADER_READ_ONLY_OPTIMAL: update() starts from it (barrierBegin old=SHADER_READ_ONLY ->
+       GENERAL for the compute write) and ends in it, and the graphics passes sample it with a SHADER_READ_ONLY
+       descriptor. It was created in GENERAL, so a surface not yet dispatched was sampled in the wrong layout
+       (VUID-vkCmdDraw-None-09600) and the first dispatch's barrier named a wrong oldLayout. Cleared so the first
+       sample is defined. */
+    YabaVkInitColorImage((VkDevice)d, vulkan->getVulkanQueue(), vulkan->getVulkanGraphicsQueueFamilyIndex(), (VkImage)tex_surface[i].image,
+      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
   }
 
   updateDescriptorSets(0);
@@ -2998,11 +3086,7 @@ vk::Pipeline RBGGeneratorVulkan::compile_color_dot(
   CompileOptions options;
   options.SetOptimizationLevel(shaderc_optimization_level_performance);
   //options.SetOptimizationLevel(shaderc_optimization_level_zero);
-  SpvCompilationResult result = compiler.CompileGlslToSpv(
-    target,
-    shaderc_compute_shader,
-    "RBG",
-    options);
+  YabaSpvResult result = YabaCompileGlslCached(compiler, target, shaderc_compute_shader, "RBG", options, "default-perf");
 
   printf("%s%d\n", " erros: ", (int)result.GetNumErrors());
   if (result.GetNumErrors() != 0) {
@@ -4279,7 +4363,22 @@ void RBGGeneratorVulkan::update(VIDVulkan::RBGDrawInfo * rbg, const vdp2rotation
   memcpy(data, rbgUniformParam, sizeof(*rbgUniformParam));
   d.unmapMemory(rbgUniform.mem);
 
-  queue.waitIdle();
+  /* Flight recorder note for this rotation layer (printed with the last frames if the GPU faults). */
+  YabaFlightNote("RBG{%dx%d scale=%.2fx%.2f colnum=%d planew=%d pagewh=%d patternwh=%d hresshift=%d paladdr=%d spcol=%d win=%d kmem=%d/%d} ",
+                 (int)rbg->hres, (int)rbg->vres, (double)rbg->rotate_mval_h, (double)rbg->rotate_mval_v, (int)rbg->info.colornumber,
+                 (int)rbg->info.planew, (int)rbg->info.pagewh, (int)rbg->info.patternwh, (int)rbg->info.hres_shift,
+                 (int)rbg->info.paladdr, (int)rbg->info.specialcolormode, (int)(rbg->info.pWinInfo != nullptr),
+                 (int)paraa.k_mem_type, (int)parab.k_mem_type);
+
+  /* The device-lost error of the NiGHTS crash is first reported by this call (it waits for ALL queued work, so the faulting job can be any
+     earlier one). Print the flight recorder before the exception takes the process down. */
+  try {
+    queue.waitIdle();
+  } catch (vk::SystemError & e) {
+    fprintf(stderr, "RBG: queue.waitIdle threw: %s\n", e.what());
+    YabaVkRunFailHook("rotation layer waitIdle");
+    throw;
+  }
 
   //vk::CommandBufferUsageFlagBits::eSimultaneousUse
 
@@ -4313,7 +4412,32 @@ void RBGGeneratorVulkan::update(VIDVulkan::RBGDrawInfo * rbg, const vdp2rotation
 
   c.bindPipeline(vk::PipelineBindPoint::eCompute, CurrentPipeline);
   c.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipelineLayout, 0, descriptorSet, nullptr);
-  c.dispatch(tex_width_ / 16, tex_height_ / 16, 1);
+  /* Must match the local_size prg_generate_rbg was generated with, not a
+     hardcoded 16 -- same ceil form as RBGGenerator::update's work_groups_x/y
+     in the OpenGL path. A mismatch here is what faulted the GPU. */
+  const int rbg_groups_x =
+      1 + (tex_width_  - 1) / prg_generate_rbg_local_x;
+  const int rbg_groups_y =
+      1 + (tex_height_ - 1) / prg_generate_rbg_local_y;
+  {
+    static int logged = 0;
+    if (!logged) {
+      logged = 1;
+      fprintf(stderr,
+              "RBG dispatch: tex %dx%d, local %dx%d, groups %dx%d, "
+              "covers %dx%d%s\n",
+              tex_width_, tex_height_,
+              prg_generate_rbg_local_x, prg_generate_rbg_local_y,
+              rbg_groups_x, rbg_groups_y,
+              rbg_groups_x * prg_generate_rbg_local_x,
+              rbg_groups_y * prg_generate_rbg_local_y,
+              (rbg_groups_x * prg_generate_rbg_local_x == tex_width_ &&
+               rbg_groups_y * prg_generate_rbg_local_y == tex_height_)
+                  ? " (exact)" : " (OVER-COVERS -- out-of-range invocations)");
+      fflush(stderr);
+    }
+  }
+  c.dispatch(rbg_groups_x, rbg_groups_y, 1);
 
   vk::ImageMemoryBarrier barrier;
   barrier.oldLayout = vk::ImageLayout::eGeneral;
@@ -4350,7 +4474,16 @@ void RBGGeneratorVulkan::update(VIDVulkan::RBGDrawInfo * rbg, const vdp2rotation
   computeSubmitInfo.signalSemaphoreCount = 1;
   computeSubmitInfo.pSignalSemaphores = &semaphores.complete;
   tex_surface[texindex].rendered = true;
-  queue.submit(computeSubmitInfo, {});
+  /* This submit used to be fire-and-forget. It signals semaphores.complete,
+     which the VDP1/VDP2 submits wait on, so if this compute job dies on the
+     GPU everything downstream waits for a semaphore that is never signalled
+     and the renderer hangs with no error reported anywhere. */
+  {
+    const vk::SubmitInfo si = computeSubmitInfo;
+    YabaVkSubmit(vulkan->getDevice(), (VkQueue)queue,
+                 reinterpret_cast<const VkSubmitInfo *>(&si),
+                 "RBGGeneratorVulkan::update compute");
+  }
   
   
   //vulkan->transitionImageLayout(VkImage(tex_surface[0].image), 

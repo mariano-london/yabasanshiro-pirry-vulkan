@@ -18,6 +18,7 @@ along with YabaSanshiro; if not, write to the Free Software
 Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 */
 
+#include "Shared.h"
 #include "WindowRenderer.h"
 #include "VIDVulkan.h"
 #include "VulkanInitializers.hpp"
@@ -121,6 +122,17 @@ int Vdp2Window::flush(VkCommandBuffer commandBuffer) {
   copyRegion.size = vertexcnt * sizeof(Vertex);
   vkCmdCopyBuffer(commandBuffer, stagingBuffer, vertexBuffer, 1, &copyRegion);
 
+  /* The copy must be visible to the vertex fetch that draws the window mask. This was implicit while the copy had a submit of its own
+     (the fence wait ordered it); with the upload recorded into the scene command buffer it has to be stated. */
+  {
+    VkMemoryBarrier memoryBarrier = {};
+    memoryBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    memoryBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    memoryBarrier.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
+    vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, 0,
+                         1, &memoryBarrier, 0, nullptr, 0, nullptr);
+  }
+
   VkDeviceSize bufferSize = sizeof(Vertex) * 512;
   vkMapMemory(device, stagingBufferMemory, 0, bufferSize, 0, (void**)&vertex);
 
@@ -211,7 +223,7 @@ void WindowRenderer::changeResolution(int width, int height) {
   this->vdp2width = width;
   this->vdp2height = height;
 
-  vkQueueWaitIdle(vulkan->getVulkanQueue());
+  YABA_QIDLE(YabaQueueWaitIdle(vulkan->getVulkanQueue()));
 
   VkDevice device = vulkan->getDevice();
 
@@ -580,18 +592,23 @@ void WindowRenderer::prepareOffscreen() {
   image.samples = VK_SAMPLE_COUNT_1_BIT;
   image.tiling = VK_IMAGE_TILING_OPTIMAL;
   // We will sample directly from the color attachment
-  image.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
+  image.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
 
   VkMemoryAllocateInfo memAlloc = vks::initializers::memoryAllocateInfo();
   VkMemoryRequirements memReqs;
 
   VK_CHECK_RESULT(vkCreateImage(device, &image, nullptr, &offscreenPass.color.image));
+  YABA_VK_NAME(device, VK_OBJECT_TYPE_IMAGE, offscreenPass.color.image, "offscreenPass.color.image");
   vkGetImageMemoryRequirements(device, offscreenPass.color.image, &memReqs);
   memAlloc.allocationSize = memReqs.size;
   //memAlloc.memoryTypeIndex = vulkanDevice->getMemoryType(memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
   memAlloc.memoryTypeIndex = vulkan->findMemoryType(memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
   VK_CHECK_RESULT(vkAllocateMemory(device, &memAlloc, nullptr, &offscreenPass.color.mem));
   VK_CHECK_RESULT(vkBindImageMemory(device, offscreenPass.color.image, offscreenPass.color.mem, 0));
+  /* sampled before its first render after (re)creation -> must already be in SHADER_READ_ONLY_OPTIMAL (VUID-vkCmdDraw-None-09600) */
+  YabaVkInitColorImage(device, vulkan->getVulkanQueue(), vulkan->getVulkanGraphicsQueueFamilyIndex(), offscreenPass.color.image,
+    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
 
   VkImageViewCreateInfo colorImageView = vks::initializers::imageViewCreateInfo();
   colorImageView.viewType = VK_IMAGE_VIEW_TYPE_2D;
@@ -604,6 +621,7 @@ void WindowRenderer::prepareOffscreen() {
   colorImageView.subresourceRange.layerCount = 1;
   colorImageView.image = offscreenPass.color.image;
   VK_CHECK_RESULT(vkCreateImageView(device, &colorImageView, nullptr, &offscreenPass.color.view));
+  YABA_VK_NAME(device, VK_OBJECT_TYPE_IMAGE_VIEW, offscreenPass.color.view, "offscreenPass.color.view");
 
 
   // Create sampler to sample from the attachment in the fragment shader
@@ -620,12 +638,14 @@ void WindowRenderer::prepareOffscreen() {
   samplerInfo.maxLod = 1.0f;
   samplerInfo.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
   VK_CHECK_RESULT(vkCreateSampler(device, &samplerInfo, nullptr, &offscreenPass.sampler));
+  YABA_VK_NAME(device, VK_OBJECT_TYPE_SAMPLER, offscreenPass.sampler, "offscreenPass.sampler");
 
   // Depth stencil attachment
   image.format = fbDepthFormat;
   image.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
 
   VK_CHECK_RESULT(vkCreateImage(device, &image, nullptr, &offscreenPass.depth.image));
+  YABA_VK_NAME(device, VK_OBJECT_TYPE_IMAGE, offscreenPass.depth.image, "offscreenPass.depth.image");
   vkGetImageMemoryRequirements(device, offscreenPass.depth.image, &memReqs);
   memAlloc.allocationSize = memReqs.size;
   memAlloc.memoryTypeIndex = vulkan->findMemoryType(memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
@@ -644,6 +664,7 @@ void WindowRenderer::prepareOffscreen() {
   depthStencilView.subresourceRange.layerCount = 1;
   depthStencilView.image = offscreenPass.depth.image;
   VK_CHECK_RESULT(vkCreateImageView(device, &depthStencilView, nullptr, &offscreenPass.depth.view));
+  YABA_VK_NAME(device, VK_OBJECT_TYPE_IMAGE_VIEW, offscreenPass.depth.view, "offscreenPass.depth.view");
 
   // Create a separate render pass for the offscreen rendering as it may differ from the one used for scene rendering
 
@@ -655,7 +676,7 @@ void WindowRenderer::prepareOffscreen() {
   attchmentDescriptions[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
   attchmentDescriptions[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
   attchmentDescriptions[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-  attchmentDescriptions[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  attchmentDescriptions[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;   /* loadOp is CLEAR: UNDEFINED is legal here */
   attchmentDescriptions[0].finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
   // Depth attachment
   attchmentDescriptions[1].format = fbDepthFormat;
@@ -681,10 +702,18 @@ void WindowRenderer::prepareOffscreen() {
 
   dependencies[0].srcSubpass = VK_SUBPASS_EXTERNAL;
   dependencies[0].dstSubpass = 0;
-  dependencies[0].srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-  dependencies[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-  dependencies[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
-  dependencies[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+  /* Widened (R4): the pass's loadOp LOAD READS the colour attachment and CLEAR/LOAD touch depth/stencil at
+     EARLY_FRAGMENT_TESTS; the old mask only allowed colour WRITE, so the layout transition and the load were
+     unsynchronised (SYNC-HAZARD-READ/WRITE-AFTER-WRITE at vkCmdBeginRenderPass). The src side covers every way
+     the image was last touched: sampled, rendered, or transferred (init clear / blits). */
+  dependencies[0].srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                 VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+  dependencies[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                 VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+  dependencies[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                                  VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+  dependencies[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                                  VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
   dependencies[0].dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
 
   dependencies[1].srcSubpass = 0;
@@ -721,6 +750,7 @@ void WindowRenderer::prepareOffscreen() {
   renderPassInfo.pDependencies = nullptr; // dependencies.data();
 
   VK_CHECK_RESULT(vkCreateRenderPass(device, &renderPassInfo, nullptr, &offscreenPass.renderPass));
+  YABA_VK_NAME(device, VK_OBJECT_TYPE_RENDER_PASS, offscreenPass.renderPass, "offscreenPass.renderPass");
 
 
 
@@ -736,6 +766,7 @@ void WindowRenderer::prepareOffscreen() {
   fbufCreateInfo.height = offscreenPass.height;
   fbufCreateInfo.layers = 1;
   VK_CHECK_RESULT(vkCreateFramebuffer(device, &fbufCreateInfo, nullptr, &offscreenPass.frameBuffer));
+  YABA_VK_NAME(device, VK_OBJECT_TYPE_FRAMEBUFFER, offscreenPass.frameBuffer, "offscreenPass.frameBuffer");
 
 
   //  VkSemaphoreCreateInfo semaphore_create_info{};

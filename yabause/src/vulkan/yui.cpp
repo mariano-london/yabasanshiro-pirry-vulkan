@@ -424,7 +424,7 @@ int main( int argc, char *argv[] )
 
   }
   
-  vkQueueWaitIdle(r.GetVulkanQueue());
+  YabaQueueWaitIdle(r.GetVulkanQueue());
 
   YabauseDeInit();
 

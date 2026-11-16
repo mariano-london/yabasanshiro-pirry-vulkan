@@ -19,6 +19,10 @@ Contributors:
 // GLFWs "glfw3.lib" file into the project, this task is up to you.
 // GLFW version 3.2 or newer is required.
 #if defined(ANDROID)
+#elif defined(YAB_VK_SDL) || defined(YAB_VK_DISPLAY)
+/* Direct-to-display (KMS/DRM) on handhelds with no window system: GLFW is
+   neither available nor meaningful there. Platform.h falls through to the
+   VK_USE_PLATFORM_DISPLAY_KHR branch instead. */
 #else
 #define BUILD_USE_GLFW											1
 #endif

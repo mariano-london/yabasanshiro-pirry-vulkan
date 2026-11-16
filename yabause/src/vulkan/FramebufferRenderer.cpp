@@ -19,6 +19,8 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 */
 
 
+#include "ShaderCache.h"
+#include "Shared.h"
 #include "FramebufferRenderer.h"
 #include "VIDVulkan.h"
 #include "VulkanTools.h"
@@ -32,6 +34,7 @@ extern "C" {
 #include "yui.h"
 #include "frameprofile.h"
 }
+extern Vdp2 * Vdp2LinesRender;   /* vdp2.cpp: live data or the VBlank-OUT snapshot */
 
 #include "shaderc/shaderc.hpp"
 using shaderc::Compiler;
@@ -186,10 +189,13 @@ FramebufferRenderer::FramebufferRenderer(VIDVulkan * vulkan) {
     layout(location = 1) in vec4 inColor;
     layout(location = 2) in vec4 a_texcoord;
 
-    layout (location = 0) out vec4 v_texcoord;
+    /* vec2, not vec4: every fragment shader paired with this vertex shader declares "in vec2 v_texcoord" and
+       uses it whole (checked for all Yglprg_vdp2_drawfb_* sources). A vec4 output feeding a vec2 input is
+       invalid without VK_KHR_maintenance4 (VUID-RuntimeSpirv-maintenance4-06817). */
+    layout (location = 0) out vec2 v_texcoord;
 
     void main() {
-        v_texcoord  = a_texcoord;
+        v_texcoord  = a_texcoord.xy;
         gl_Position = ubo.u_mvpMatrix * a_position;
 
     }
@@ -221,14 +227,24 @@ void FramebufferRenderer::setup() {
   createIndexBuffer(indices);
   createDescriptorSets();
   setupShaders();
+  YabaTrimMemory("after FramebufferRenderer::setupShaders");
+}
+
+/* CPU side of the per-frame set-up: fills the per-line buffer from this frame's register snapshot and decides
+   lineTexture. Must run BEFORE the pre-pass upload (flush()) of the same frame. */
+void FramebufferRenderer::prepareFrame(Vdp2 * fixVdp2Regs) {
+  renderCount = 0;
+  updateVdp2Reg(fixVdp2Regs);
 }
 
 void FramebufferRenderer::onStartFrame(Vdp2 * fixVdp2Regs, VkCommandBuffer commandBuffer) {
-  renderCount = 0;
-  updateVdp2Reg(fixVdp2Regs);
-  if (lineTexture != VK_NULL_HANDLE) {
-    perline.update(vulkan, commandBuffer);
-  }
+  /* This runs INSIDE the open main render pass. It used to fill the per-line buffer here and then record
+     perline.update() -- a vkCmdCopyBufferToImage plus image barriers -- into the pass, which is illegal
+     (VUID-vkCmdCopyBufferToImage-renderpass, VUID-vkCmdPipelineBarrier-oldLayout-01181/-image-04073/-None-07889,
+     236 times in the engine-start scene) and which Mali does not tolerate. The pre-pass flush() meanwhile uploaded
+     the PREVIOUS frame's data, because the buffer was only filled here. Now: prepareFrame() fills the buffer before
+     the pre-pass uploads, flush() uploads it outside the pass, and nothing is copied in here. */
+  (void)fixVdp2Regs; (void)commandBuffer;
 }
 
 void FramebufferRenderer::onEndFrame() {
@@ -267,7 +283,7 @@ void FramebufferRenderer::updateVdp2Reg(Vdp2 * fixVdp2Regs) {
     linebuf = perline.dynamicBuf;
     for (line = 0; line < vulkan->vdp2height; line++) {
       linebuf[line] = 0xFF000000;
-      Vdp2 * lVdp2Regs = &Vdp2Lines[line >> line_shift];
+      Vdp2 * lVdp2Regs = &Vdp2LinesRender[line >> line_shift];   /* snapshot taken at VBlank-OUT; the emulation thread is already writing Vdp2Lines for the next frame (TSAN, L4) */
 
       u8 *cclist = (u8 *)&lVdp2Regs->CCRSA;
       u8 *prilist = (u8 *)&lVdp2Regs->PRISA;
@@ -920,13 +936,17 @@ VkPipeline FramebufferRenderer::compileShader(const char * code, const char * na
 
   Compiler compiler;
   CompileOptions options;
+  /* Modern shaderc/glslang (Debian 2025.2 here, vs the old Android NDK copy
+     this code was written against) will not build its built-in symbol table
+     without a target environment: it falls back to profile "none" and dies
+     with "'double' : not supported with this profile: none / INTERNAL ERROR:
+     Unable to parse built-ins", reporting ZERO errors while emitting no
+     SPIR-V, so vkCreateShaderModule then fails. */
+  options.SetTargetEnvironment(shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_1);
+  options.SetTargetSpirv(shaderc_spirv_version_1_3);
   options.SetOptimizationLevel(shaderc_optimization_level_performance);
   //options.SetOptimizationLevel(shaderc_optimization_level_zero);
-  SpvCompilationResult result = compiler.CompileGlslToSpv(
-    target,
-    shaderc_fragment_shader,
-    name,
-    options);
+  YabaSpvResult result = YabaCompileGlslCached(compiler, target, shaderc_fragment_shader, name, options, "vk11-spv13-perf");
 
   LOGI("%s%d\n", " erros: ", (int)result.GetNumErrors());
   if (result.GetNumErrors() != 0) {
@@ -1026,6 +1046,7 @@ VkPipeline FramebufferRenderer::compileShader(const char * code, const char * na
   if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &graphicsPipeline) != VK_SUCCESS) {
     throw std::runtime_error("failed to create graphics pipeline!");
   }
+  YABA_VK_NAME(device, VK_OBJECT_TYPE_PIPELINE, graphicsPipeline, "graphicsPipeline");
 
   pipelines[name] = graphicsPipeline;
 
@@ -1146,13 +1167,17 @@ void FramebufferRenderer::createDescriptorSets() {
 
   Compiler compiler;
   CompileOptions options;
+  /* Modern shaderc/glslang (Debian 2025.2 here, vs the old Android NDK copy
+     this code was written against) will not build its built-in symbol table
+     without a target environment: it falls back to profile "none" and dies
+     with "'double' : not supported with this profile: none / INTERNAL ERROR:
+     Unable to parse built-ins", reporting ZERO errors while emitting no
+     SPIR-V, so vkCreateShaderModule then fails. */
+  options.SetTargetEnvironment(shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_1);
+  options.SetTargetSpirv(shaderc_spirv_version_1_3);
   options.SetOptimizationLevel(shaderc_optimization_level_performance);
   //options.SetOptimizationLevel(shaderc_optimization_level_zero);
-  SpvCompilationResult result = compiler.CompileGlslToSpv(
-    get_shader_header() + vertexShaderName,
-    shaderc_vertex_shader,
-    "framebuffer",
-    options);
+  YabaSpvResult result = YabaCompileGlslCached(compiler, get_shader_header() + vertexShaderName, shaderc_vertex_shader, "framebuffer", options, "vk11-spv13-perf");
 
   std::cout << " erros: " << result.GetNumErrors() << std::endl;
   if (result.GetNumErrors() != 0) {
@@ -1409,6 +1434,7 @@ void FramebufferRenderer::createDescriptorSets() {
   if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &_graphicsPipeline) != VK_SUCCESS) {
     throw std::runtime_error("failed to create graphics pipeline!");
   }
+  YABA_VK_NAME(device, VK_OBJECT_TYPE_PIPELINE, _graphicsPipeline, "_graphicsPipeline");
 #endif
 
 }

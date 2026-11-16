@@ -18,6 +18,7 @@ along with YabaSanshiro; if not, write to the Free Software
 Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 */
 
+#include "Shared.h"
 #include "VdpPipelineFactory.h"
 #include "VdpPipeline.h"
 #include "VIDVulkan.h"
@@ -166,6 +167,7 @@ VdpPipeline * VdpPipelineFactory::getPipeline(
 
   current->setRenderPass(this->renderPass);
   current->createGraphicsPipeline();
+  YabaTrimMemory("after creating a pipeline");   /* shaderc just filled the heap; give it back (see YabaTrimMemory) */
   return current;
 }
 

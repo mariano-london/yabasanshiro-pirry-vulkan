@@ -20,6 +20,9 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #pragma once
 
 extern "C" {
+#include <pthread.h>
+#include "GpuTimer.h"
+#include "ZeroAlloc.h"
 #include "vidshared.h"
 #include "debug.h"
 #include "vdp2.h"
@@ -42,6 +45,9 @@ class VdpPipeline;
 using std::vector;
 
 class Vdp1Renderer {
+public:
+  YABA_ZERO_NEW
+private:
 
 
   // Framebuffer for offscreen rendering
@@ -60,7 +66,7 @@ class Vdp1Renderer {
     VkRenderPass renderPass;
     VkSampler sampler;
     VkDescriptorImageInfo descriptor;
-  } offscreenPass;
+  } offscreenPass = {};   /* value-initialised: renderPass etc. are tested against VK_NULL_HANDLE */
 
   struct vdp1Ubo {
     glm::mat4 model;
@@ -72,6 +78,9 @@ class Vdp1Renderer {
   };
 
 public:
+  void flushPending() { completePending(); }   /* both sets: nothing of this renderer is in flight afterwards */
+  void setDeferred(bool d) { deferVdp1 = d; if (d && !vdual) createAltSet(); }   /* two frames in flight: see completePending() */
+
   Vdp1Renderer(int width, int height, VIDVulkan * vulkan);
   ~Vdp1Renderer();
 
@@ -135,6 +144,43 @@ public:
 protected:
 
   VIDVulkan * vulkan;
+  YabaGpuTimer gpuTimer;   /* GPU time of the offscreen pass (instrumentation) */
+
+  /* Deferred completion (two frames in flight, YABA_VK_DEFER): the offscreen draw and the erase of a VDP1 frame are submitted without waiting.
+     Everything they use (atlas staging, vertex buffers, command pool, uniform buffers, the CPU-written framebuffer staging) is only touched again
+     by the next drawStart() or by the CPU-facing framebuffer accessors, which call completePending() first. The GPU executes in queue order, so
+     the VDP2 scene that reads the result needs no fence of its own. */
+  /* Two sets of the resources a VDP1 frame rewrites (atlas + vertex buffers, pipeline pool, command pool, uniform buffers, the erase pipeline's
+     descriptor), used alternately from drawStart(). The members always belong to the CURRENT set; saveSet/loadSet copy them to and from the slot.
+     Frame N+1 can then start on the CPU while the GPU still executes frame N, and the fences are waited two frames later (YABA_VK_DEFER). */
+  struct Vdp1Set {
+    TextureManager * tm = nullptr; VertexManager * vm = nullptr; VdpPipelineFactory * factory = nullptr;
+    VkCommandPool pool = VK_NULL_HANDLE; std::vector<VkCommandBuffer> cbs; uint32_t curCb = 0;
+    VkBuffer uniformBuffer = VK_NULL_HANDLE; VkDeviceMemory uniformBufferMemory = VK_NULL_HANDLE;
+    vector<VdpPipeline*> pipes; VdpPipeline * current = nullptr;
+    YabaGpuTimer timer;
+    VkBuffer vertexBuffer = VK_NULL_HANDLE; VkDeviceMemory vertexBufferMemory = VK_NULL_HANDLE;
+    VkBuffer indexBuffer = VK_NULL_HANDLE; VkDeviceMemory indexBufferMemory = VK_NULL_HANDLE;
+    VkBuffer clearUniformBuffer = VK_NULL_HANDLE; VkDeviceMemory clearUniformBufferMemory = VK_NULL_HANDLE;
+    VkDescriptorSet descriptorSet = VK_NULL_HANDLE; VkDescriptorSetLayout descriptorSetLayout = VK_NULL_HANDLE; VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
+    VkShaderModule vertShaderModule = VK_NULL_HANDLE, fragShaderModule = VK_NULL_HANDLE;
+    VkPipelineLayout pipelineLayout = VK_NULL_HANDLE; VkPipeline graphicsPipeline = VK_NULL_HANDLE;
+    VkFence pendingOffscreen = VK_NULL_HANDLE, pendingErase = VK_NULL_HANDLE; bool pendingMerge = false;
+  };
+  Vdp1Set vsets[2];
+  int vcur = 0;
+  bool vdual = false;
+  void saveSet(Vdp1Set & s);
+  void loadSet(const Vdp1Set & s);
+  void createAltSet();
+  void selectNextSet();
+  void completeCurrent();   /* the current set's deferred submits */
+  VkFence pendingOffscreen = VK_NULL_HANDLE;
+  VkFence pendingErase = VK_NULL_HANDLE;
+  bool pendingMergeUpload = false;
+  bool deferVdp1 = false;
+  pthread_mutex_t pendingMutex = PTHREAD_MUTEX_INITIALIZER;   /* a plain pthread mutex: this header is included inside extern "C" blocks */
+  void completePending();
   TextureManager * tm;
   VertexManager  * vm;
   VdpPipelineFactory * pipleLineFactory;
@@ -174,6 +220,8 @@ protected:
 
   void createUniformBuffer();
   void prepareOffscreen();
+  void initVdp1Layouts();
+  VkFormat vdp1DepthFormat = VK_FORMAT_UNDEFINED;
 
   int width;
   int height;
@@ -244,6 +292,6 @@ protected:
 
   int msbShadowCount[2] = {};
 
-  POLYGONMODE proygonMode;
+  POLYGONMODE proygonMode = PERSPECTIVE_CORRECTION;
 
 };

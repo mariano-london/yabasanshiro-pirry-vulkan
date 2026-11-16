@@ -21,6 +21,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #pragma once
 
 extern "C" {
+#include "ZeroAlloc.h"
 #include "vidshared.h"
 #include "debug.h"
 #include "vdp2.h"
@@ -92,6 +93,9 @@ private:
 
 class VdpPipeline {
 public:
+  YABA_ZERO_NEW
+private:
+public:
 
   VdpPipeline(
     VIDVulkan * vulkan,
@@ -135,6 +139,10 @@ public:
   static const int bindIdLine;
   static const int bindIdWindow;
 
+  /* True for the VDP1 pipelines that read the framebuffer they render into (binding 2 = the VDP1 framebuffer, in GENERAL during the pass).
+     Binding 2 is the colour RAM in the VDP2 pipelines, which stay SHADER_READ_ONLY_OPTIMAL. */
+  bool fboFeedback = false;
+
   void setSampler(int id, VkImageView img, VkSampler smp) {
     samplers[id].img = img;
     samplers[id].smp = smp;
@@ -167,6 +175,12 @@ public:
   float * matrix;
   int mosaic[2];
   VkImageView lineTexture = VK_NULL_HANDLE;
+  /* Geometry statistics of the last moveToVertexBuffer() call (instrumentation for the flight recorder). */
+  float dbgMinX = 0, dbgMinY = 0, dbgMaxX = 0, dbgMaxY = 0;
+  int dbgNonFinite = 0;     // vertices with a NaN/Inf position
+  int dbgHuge = 0;          // vertices more than 8x the screen away from the origin
+  int dbgMaxIndex = -1;     // largest index in the index list (must be < vertex count)
+  int dbgBadIndex = 0;      // indices >= vertex count
   int id;
   int colornumber;
 
@@ -178,6 +192,8 @@ public:
 
   VkPipelineLayout getPipelineLayout() { return _pipelineLayout; }
   VkPipeline getGraphicsPipeline() { return _graphicsPipeline; }
+  /* Distinguishes instances of the same class whose Vulkan pipeline differs (only the window pipelines are built per id). */
+  virtual int variantKey() const { return 0; }
   VkDescriptorSet getDescriptorSete() { return _descriptorSet; }
 
   VkDescriptorSet _descriptorSet;
@@ -218,6 +234,7 @@ protected:
   VkShaderModule geometryModule;
   VkPipelineLayout _pipelineLayout;
   VkPipeline _graphicsPipeline;
+  std::string _sharedPipeKey;   /* non-empty: _graphicsPipeline/_pipelineLayout are shared (see createGraphicsPipeline) */
 
   virtual void createColorAttachment(VkPipelineColorBlendAttachmentState & colorAttachment);
   virtual void createDpethStencil(VkPipelineDepthStencilStateCreateInfo & depthStencil);
@@ -323,6 +340,7 @@ public:
 class VdpPipelineWindow : public VdpPipeline {
   int id;
 public:
+  int variantKey() const override { return id; }
   VdpPipelineWindow(int id, VIDVulkan * vulkan, TextureManager * tm, VertexManager * vm);
   void createColorAttachment(VkPipelineColorBlendAttachmentState & color);
   void createDpethStencil(VkPipelineDepthStencilStateCreateInfo & depthStencil);

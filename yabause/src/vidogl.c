@@ -369,7 +369,21 @@ vdp2rotationparameter_struct * FASTCALL vdp2RGetParamMode03WithK(vdp2draw_struct
 static void FASTCALL Vdp1ReadPriority(vdp1cmd_struct *cmd, int * priority, int * colorcl, int * normal_shadow);
 
 // out_no_alpha0 is 1 if no alpha-0/end-code texel was written during this decode (texture fully opaque for this command), else 0.
-static void FASTCALL Vdp1ReadTexture(vdp1cmd_struct *cmd, YglSprite *sprite, YglTexture *texture, u8 * out_no_alpha0);
+#include "perflog.h"
+
+/* Timing wrapper. Reaching Vdp1ReadTexture means the VDP1 texture cache
+   MISSED (the hit path returns earlier), so this counts misses and times the
+   Saturn->GL texture decode they cause. Runs on the render thread. */
+static void FASTCALL Vdp1ReadTexture_impl(vdp1cmd_struct *cmd, YglSprite *sprite, YglTexture *texture, u8 * out_no_alpha0);
+static void FASTCALL Vdp1ReadTexture(vdp1cmd_struct *cmd, YglSprite *sprite, YglTexture *texture, u8 * out_no_alpha0)
+{
+  if (!g_perf_on) { Vdp1ReadTexture_impl(cmd, sprite, texture, out_no_alpha0); return; }
+  {
+    const long long _t0 = PerfNowNs();
+    Vdp1ReadTexture_impl(cmd, sprite, texture, out_no_alpha0);
+    PerfAddTexDecode(PerfNowNs() - _t0);
+  }
+}
 
 u32 FASTCALL Vdp2ColorRamGetColorCM01SC0(vdp2draw_struct * info, u32 colorindex, int alpha, u8 lowdot);
 u32 FASTCALL Vdp2ColorRamGetColorCM01SC1(vdp2draw_struct * info, u32 colorindex, int alpha, u8 lowdot);
@@ -669,7 +683,7 @@ static u32 FASTCALL Vdp1ReadPolygonColor(vdp1cmd_struct *cmd)
 }
 
 
-static void FASTCALL Vdp1ReadTexture(vdp1cmd_struct *cmd, YglSprite *sprite, YglTexture *texture, u8 * out_no_alpha0)
+static void FASTCALL Vdp1ReadTexture_impl(vdp1cmd_struct *cmd, YglSprite *sprite, YglTexture *texture, u8 * out_no_alpha0)
 {
   int shadow = 0;
   int normalshadow = 0;

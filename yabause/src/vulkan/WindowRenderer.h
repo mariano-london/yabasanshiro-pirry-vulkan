@@ -21,6 +21,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #pragma once
 
 extern "C" {
+#include "ZeroAlloc.h"
 #include "vidshared.h"
 #include "debug.h"
 #include "vdp2.h"
@@ -79,6 +80,9 @@ public:
 };
 
 class WindowRenderer {
+public:
+  YABA_ZERO_NEW
+private:
 
   struct FrameBufferAttachment {
     VkImage image;

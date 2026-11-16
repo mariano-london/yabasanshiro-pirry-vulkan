@@ -34,6 +34,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #include <stdlib.h>
 #include <unistd.h>
 
+#include "MenuLayer.h"
 #include "MenuScreen.h"
 extern "C"{
 #include "yabause.h"
@@ -1052,7 +1053,7 @@ int InputManager::handleJoyEvents(void) {
 
 static const int DEADZONE = 23000;
 
-void InputManager::setMenuLayer( MenuScreen * menu_layer ){
+void InputManager::setMenuLayer( MenuLayer * menu_layer ){
   menu_layer_ = menu_layer;
   if( menu_layer_ != nullptr ){
     menu_layer_->setCurrentInputDevices( mJoysticks );

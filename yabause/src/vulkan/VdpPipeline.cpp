@@ -18,7 +18,28 @@ along with YabaSanshiro; if not, write to the Free Software
 Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 */
 
+#include "Shared.h"
 #include "VdpPipeline.h"
+#include "ShaderCache.h"
+#include <map>
+#include <mutex>
+#include <typeinfo>
+
+/* ---- shared Vulkan pipelines -----------------------------------------------------------------------------------
+   Every VdpPipeline object is one batch of draws (vertices, descriptor set, uniform buffer), and the factory creates a
+   new object whenever a frame needs more batches than before. Each object used to create its OWN VkPipeline and
+   VkPipelineLayout, although every object of the same class/render pass needs the identical ones. On the handheld that
+   made every new batch a driver pipeline compile plus fresh memory (hundreds of creations in a burst at scene starts:
+   131 at the first race frame in the rig), which is what stalled the emulator for 0.3-1.3 s on a 1 GB device.
+   Now the first object creates them and the rest reuse them (reference counted). Descriptor sets, layouts and the
+   uniform buffer stay per object; identically defined descriptor set layouts are compatible, so a shared pipeline
+   layout accepts any of those sets. */
+namespace {
+struct SharedPipe { VkPipeline pipeline; VkPipelineLayout layout; int refs; };
+std::map<std::string, SharedPipe> g_sharedPipes;
+std::mutex g_sharedPipesMutex;
+unsigned g_pipeCreated = 0, g_pipeShared = 0;
+}
 #include "VIDVulkan.h"
 #include "TextureManager.h"
 #include "VertexManager.h"
@@ -75,13 +96,17 @@ VkShaderModule ShaderManager::compileShader(uint32_t id, const string & code, in
 
     Compiler compiler;
     CompileOptions options;
+    /* Modern shaderc/glslang (Debian 2025.2 here, vs the old Android NDK copy
+       this code was written against) will not build its built-in symbol table
+       without a target environment: it falls back to profile "none" and dies
+       with "'double' : not supported with this profile: none / INTERNAL ERROR:
+       Unable to parse built-ins", reporting ZERO errors while emitting no
+       SPIR-V, so vkCreateShaderModule then fails. */
+    options.SetTargetEnvironment(shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_1);
+    options.SetTargetSpirv(shaderc_spirv_version_1_3);
     options.SetOptimizationLevel(shaderc_optimization_level_performance);
     //options.SetOptimizationLevel(shaderc_optimization_level_zero);
-    SpvCompilationResult result = compiler.CompileGlslToSpv(
-      target,
-      (shaderc_shader_kind)type,
-      "VdpPipeline",
-      options);
+    YabaSpvResult result = YabaCompileGlslCached(compiler, target, (shaderc_shader_kind)type, "VdpPipeline", options, "vk11-spv13-perf");
 
     LOGI("%s%d", "erros: ", (int)result.GetNumErrors());
     if (result.GetNumErrors() != 0) {
@@ -238,6 +263,17 @@ VdpPipeline::~VdpPipeline() {
     _descriptorSetLayout = VK_NULL_HANDLE;
   }
 
+  bool destroyPipe = true;
+  if (!_sharedPipeKey.empty()) {
+    std::lock_guard<std::mutex> lk(g_sharedPipesMutex);
+    auto it = g_sharedPipes.find(_sharedPipeKey);
+    if (it != g_sharedPipes.end()) {
+      if (--it->second.refs > 0) destroyPipe = false;        /* others still use them: just drop our handles */
+      else g_sharedPipes.erase(it);
+    }
+    if (!destroyPipe) { _pipelineLayout = VK_NULL_HANDLE; _graphicsPipeline = VK_NULL_HANDLE; }
+  }
+
   if (_pipelineLayout != VK_NULL_HANDLE) {
     vkDestroyPipelineLayout(device, _pipelineLayout, nullptr);
     _pipelineLayout = VK_NULL_HANDLE;
@@ -277,6 +313,27 @@ VkShaderModule VdpPipeline::compileShader(const string & code, int type) {
 
 void VdpPipeline::moveToVertexBuffer(const vector<Vertex> & vertices, const vector<uint16_t> & indices) {
   if (vertices.size() > 0) {
+    /* Geometry statistics for the flight recorder, same results as before in one branch-free pass: this ran over every
+       vertex of every batch every frame (about 37,000 vertices in a VF2 frame) and showed up in the render-thread profile.
+       NaN fails every comparison, so it is excluded from min/max by construction and counted by x != x.
+       +-Inf is counted in nonfinite but, unlike the old code, is NOT skipped for min/max (the bbox can show +-Inf). */
+    float mnx = 1e30f, mny = 1e30f, mxx = -1e30f, mxy = -1e30f;
+    int nonfinite = 0, huge = 0;
+    const Vertex * vp = vertices.data();
+    const size_t vn = vertices.size();
+    for (size_t i = 0; i < vn; i++) {
+      const float x = vp[i].pos.x, y = vp[i].pos.y;
+      nonfinite += (int)((x != x) | (y != y) | (x > 3.0e38f) | (x < -3.0e38f) | (y > 3.0e38f) | (y < -3.0e38f));
+      mnx = x < mnx ? x : mnx; mxx = x > mxx ? x : mxx;
+      mny = y < mny ? y : mny; mxy = y > mxy ? y : mxy;
+      huge += (int)((x > 8192.0f) | (x < -8192.0f) | (y > 8192.0f) | (y < -8192.0f));
+    }
+    dbgMinX = mnx; dbgMinY = mny; dbgMaxX = mxx; dbgMaxY = mxy; dbgNonFinite = nonfinite; dbgHuge = huge;
+    unsigned mxi = 0, bad = 0;
+    const uint16_t * ip = indices.data();
+    const size_t in = indices.size();
+    for (size_t i = 0; i < in; i++) { mxi = ip[i] > mxi ? ip[i] : mxi; bad += (ip[i] >= vn); }
+    dbgMaxIndex = in ? (int)mxi : -1; dbgBadIndex = (int)bad;
     vm->add(vertices, indices, vectexBlock, vertexOffset, vertexSize, indexOffset, indexSize);
   }
 }
@@ -323,6 +380,22 @@ void VdpPipeline::createGraphicsPipeline() {
 
 
   initDescriptorSets(bindid);
+
+  {
+    char kb[256];
+    snprintf(kb, sizeof(kb), "%s|%d|%d|%p", typeid(*this).name(), (int)prgid, variantKey(), (void *)this->renderPass);
+    std::lock_guard<std::mutex> lk(g_sharedPipesMutex);
+    auto it = g_sharedPipes.find(kb);
+    if (it != g_sharedPipes.end()) {
+      it->second.refs++;
+      _graphicsPipeline = it->second.pipeline;
+      _pipelineLayout = it->second.layout;
+      _sharedPipeKey = kb;
+      g_pipeShared++;
+      return;   /* nothing else to create: descriptor set, layout and uniform buffer are already per object */
+    }
+    _sharedPipeKey = kb;   /* this object creates them below and registers them at the end */
+  }
 
   _vertShaderModule = compileShader(vertexShaderName, shaderc_vertex_shader);
   VkPipelineShaderStageCreateInfo vertShaderStageInfo = {};
@@ -503,7 +576,15 @@ void VdpPipeline::createGraphicsPipeline() {
   if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &_graphicsPipeline) != VK_SUCCESS) {
     throw std::runtime_error("failed to create graphics pipeline!");
   }
+  YABA_VK_NAME(device, VK_OBJECT_TYPE_PIPELINE, _graphicsPipeline, "_graphicsPipeline");
 
+  {
+    std::lock_guard<std::mutex> lk(g_sharedPipesMutex);
+    g_sharedPipes[_sharedPipeKey] = SharedPipe{ _graphicsPipeline, _pipelineLayout, 1 };
+    g_pipeCreated++;
+    if (g_pipeCreated <= 40 || (g_pipeCreated % 50) == 0)
+      printf("PIPELINES: %u Vulkan pipelines created, %u batch objects reused one (%s prg=%d)\n", g_pipeCreated, g_pipeShared, typeid(*this).name(), (int)prgid);
+  }
 }
 
 void VdpPipeline::createInputAssembly(VkPipelineInputAssemblyStateCreateInfo & inputAssembly) {
@@ -861,7 +942,11 @@ void VdpPipeline::updateDescriptorSets()
   VkDescriptorImageInfo imageInfos[32];
   for (int i = 0; i < bindid.size(); i++) {
 
-    imageInfos[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    /* The VDP1 framebuffer (bindIdFbo) is sampled by the very pass that renders into it (mesh / shadow / half-luminance read the destination). The
+       image stays in GENERAL for the whole VDP1 pass (Vdp1Renderer's canonical layouts), so the descriptor must say GENERAL: with
+       SHADER_READ_ONLY_OPTIMAL the validation layer reports a layout mismatch on every draw (NiGHTS: 2,000 errors) and the Mali, which keys its
+       framebuffer compression on the layout, read invalid memory (JOB_READ_FAULT, DeviceLost) in NiGHTS on the handheld. */
+    imageInfos[i].imageLayout = (fboFeedback && bindid[i] == bindIdFbo) ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     imageInfos[i].imageView = samplers[bindid[i]].img;
     imageInfos[i].sampler = samplers[bindid[i]].smp;
 
@@ -1269,10 +1354,12 @@ VdpPipelineBlit::VdpPipelineBlit(VIDVulkan * vulkan, TextureManager * tm, Vertex
 
   fragShaderName = R"s(
   layout(binding = 1) uniform sampler2D s_texture;
-  layout(location = 0) in vec2 v_texcoord;
+  /* vec4 to match the vertex shader above, which the derived pipelines (mosaic, per-line...) share with this one and whose
+     fragment shaders read more than .xy; a vec2 input behind a vec4 output is invalid (VUID-RuntimeSpirv-maintenance4-06817). */
+  layout(location = 0) in vec4 v_texcoord;
   layout(location = 0) out vec4 outColor;
   void main() {
-    outColor = texture( s_texture, v_texcoord ) ;
+    outColor = texture( s_texture, v_texcoord.xy ) ;
   }
 
   )s";
@@ -1750,6 +1837,7 @@ VDP1HalfLuminance::VDP1HalfLuminance(VIDVulkan * vulkan, TextureManager * tm, Ve
   bindid.clear();
   bindid.push_back(bindIdTexture);
   bindid.push_back(bindIdFbo);
+  fboFeedback = true;
 
 
   fragShaderName = R"S(
@@ -1801,6 +1889,7 @@ VDP1Shadow::VDP1Shadow(VIDVulkan * vulkan, TextureManager * tm, VertexManager * 
   bindid.clear();
   bindid.push_back(bindIdTexture);
   bindid.push_back(bindIdFbo);
+  fboFeedback = true;
 
   fragShaderName = R"S(
     layout(binding = 0) uniform UniformBufferObject {
@@ -1855,6 +1944,7 @@ VDP1GlowShadingAndHalfTransOperation::VDP1GlowShadingAndHalfTransOperation(VIDVu
   bindid.clear();
   bindid.push_back(bindIdTexture);
   bindid.push_back(bindIdFbo);
+  fboFeedback = true;
 
   fragShaderName = R"S(
     layout(binding = 0) uniform UniformBufferObject {

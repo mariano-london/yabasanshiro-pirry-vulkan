@@ -30,6 +30,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 
 #pragma once
 
+#include "ZeroAlloc.h"
 #include "Platform.h"
 
 #include <vector>
@@ -39,6 +40,9 @@ class Window;
 
 class Renderer
 {
+public:
+  YABA_ZERO_NEW
+private:
 public:
   Renderer();
   ~Renderer();

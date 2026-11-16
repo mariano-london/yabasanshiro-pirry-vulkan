@@ -19,6 +19,7 @@ along with YabaSanshiro; if not, write to the Free Software
 Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 */
 
+#include "ZeroAlloc.h"
 #include "VulkanScene.h"
 class VIDVulkan;
 
@@ -48,8 +49,8 @@ public:
 
   //VkCommandBuffer commandBuffer;
 
-  char * vdata;
-  char * idata;
+  char * vdata = nullptr;
+  char * idata = nullptr;
 
   void freeBuffers(VkDevice device) {
 
@@ -108,6 +109,9 @@ public:
 
 
 class VertexManager {
+public:
+  YABA_ZERO_NEW
+private:
 public:
   VertexManager(VIDVulkan * vulkan);
   ~VertexManager();

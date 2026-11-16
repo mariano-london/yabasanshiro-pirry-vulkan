@@ -54,6 +54,7 @@ namespace fs = std::filesystem;
 extern "C" {
 #include "../config.h"
 #include "yabause.h"
+#include "perflog.h"
 #include "vdp2.h"
 #include "scsp.h"
 #include "vidsoft.h"
@@ -77,6 +78,7 @@ extern "C" {
 
 #include "InputManager.h"
 #include "MenuScreen.h"
+#include "TextMenu.h"
 extern "C" void SmpcSetSystemLanguage(int id);   /* smpc.c */
 #include "Preference.h"
 #include "RetroAchievements.h"
@@ -154,9 +156,19 @@ SoundInterface_struct *SNDCoreList[] = {
   NULL
 };
 
+#ifdef HAVE_VULKAN
+#include "vulkan/VIDVulkanCInterface.h"
+#endif
+
 VideoInterface_struct *VIDCoreList[] = {
   &VIDDummy,
   &VIDOGL,
+#ifdef HAVE_VULKAN
+  /* Built only with -DYAB_WANT_VULKAN=ON. The surface comes from
+     VK_KHR_display (vulkan/Window_display.cpp) because these devices have no
+     X server or Wayland compositor. */
+  &CVIDVulkan,
+#endif
   NULL
 };
 
@@ -165,7 +177,17 @@ VideoInterface_struct *VIDCoreList[] = {
 #include "nanovg/nanovg_osdcore.h"
 
 OSD_struct *OSDCoreList[] = {
+#if defined(YABA_VULKAN_ONLY)
+  /* OSDNnovg builds its NanoVG context on GL via getGlobalNanoVGContext(),
+     which is null without the nanogui menu: its Init() then fails while
+     OSDInit() has already published it as the active core, so the first
+     status message would draw through a null NVGcontext. The Vulkan OSD
+     (nanovg_vulkan_osdcore.cpp) takes its context from
+     NanovgVulkanSetDevices(), which VIDVulkan calls each frame. */
+  &OSDNnovgVulkan,
+#else
   &OSDNnovg,
+#endif
   &OSDDummy,
   NULL
 };
@@ -173,6 +195,13 @@ OSD_struct *OSDCoreList[] = {
 
 
 static SDL_Window* wnd;
+
+#if defined(YABA_VULKAN_ONLY)
+/* The Vulkan surface backend (vulkan/Window_sdl.cpp) needs the window the
+   front end already owns, and `wnd` is file-local. */
+extern "C" SDL_Window *YabaGetSDLWindow(void) { return wnd; }
+
+#endif
 static SDL_GLContext glc;
 
 /* Release the GL context and the window before SDL_Quit(). SDL_Quit() alone
@@ -204,14 +233,22 @@ static int g_frame_skip_cli = -1;
 int g_emulated_bios = 1;
 InputManager* inputmng;
 MenuScreen * menu;
+TextMenu * textmenu = nullptr;   /* Vulkan build: the text menu (see TextMenu.h) */
+#if defined(YABA_VULKAN_ONLY)
+static void DrawTextMenu();
+#endif
 
 using std::string;
+/* Fork identity: shown by --version and logged at start so a log or a bug report names the exact build. */
+#define YABA_VULKAN_FORK_VERSION "0.9.0"
+#define YABA_PIRRY_BASE_VERSION "1.6.3"
 string g_keymap_filename;
 
 void hideMenuScreen();
 
 //---------------------------------------------------------------------------------------------
 NVGcontext * getGlobalNanoVGContext(){
+  if (!menu) return nullptr;   /* Vulkan build: no nanogui menu */
   return menu->nvgContext();
 }
 
@@ -226,20 +263,43 @@ void YuiErrorMsg(const char *string)
 
 void YuiSwapBuffers(void)
 {
-  SDL_GL_SwapWindow(wnd);
+#if defined(YABA_VULKAN_ONLY)
+  /* There is no GL context, so SDL_GL_SwapWindow() is a no-op and nothing
+     would ever reach the panel. VIDVulkan::present() is the Vulkan present
+     (same as vulkan/yui.cpp:174 in the reference front end). */
+  PERF_TIME(PerfAddSwapNs, VIDVulkanPresent());
+#else
+  /* Timed: this is the real present during gameplay (called from ygles.c on
+     the render thread), so it captures vsync / GPU block time. */
+  PERF_TIME(PerfAddSwapNs, SDL_GL_SwapWindow(wnd));
+#endif
   SetOSDToggle(g_EnagleFPS);
 }
 
 int YuiRevokeOGLOnThisThread(){
+#if defined(YABA_VULKAN_ONLY)
+  /* No GL context to revoke; Vulkan has no per-thread current context. */
+  return 0;
+#else
   LOG("revoke thread\n");
   SDL_GL_MakeCurrent(wnd,nullptr);
   return 0;
+#endif
 }
 
 int YuiUseOGLOnThisThread(){
+#if defined(YABA_VULKAN_ONLY)
+  /* MUST return 0. VdpProc() (vdp2.cpp:798) aborts the render thread when
+     this returns < 0, and SDL_GL_MakeCurrent() fails on a window created
+     with SDL_WINDOW_VULKAN (no EGL/GL driver loaded) -- which left the
+     emulator running with nothing drawing at all. Matches
+     vulkan/yui.cpp:184. */
+  return 0;
+#else
   LOG("use thread\n");
   SDL_GL_MakeCurrent(wnd,glc);
   return 0;
+#endif
 }
 
 }
@@ -303,7 +363,15 @@ int yabauseinit()
   yinit.sh2coretype = 3;
 #endif  
   //yinit.vidcoretype = VIDCORE_SOFT;
+  /* This is a core ID, not an index into VIDCoreList: VIDCORE_OGL == 1,
+     VIDCORE_VULKAN == 4. Registering CVIDVulkan in the list is not enough —
+     without this the Vulkan build still asked for the OpenGL core and then
+     failed in yabauseinit() because it has no GL context. */
+#if defined(YABA_VULKAN_ONLY)
+  yinit.vidcoretype = VIDCORE_VULKAN;
+#else
   yinit.vidcoretype = 1;
+#endif
   yinit.sndcoretype = SNDCORE_SDL;
   //yinit.sndcoretype = SNDCORE_DUMMY;
   //yinit.cdcoretype = CDCORE_DEFAULT;
@@ -347,6 +415,14 @@ int yabauseinit()
   /* Half-height interlaced backgrounds, "interlace half" config key (default off). */
   g_interlace_half_menu = pre.getInt("interlace half", 0) ? 1 : 0;
   yinit.resolution_mode = pre.getInt( "Resolution" ,g_resolution_mode);
+  /* The Vulkan core was staying at RES_NATIVE whatever the per-game config
+     said. Print what the front end actually read, so the log says whether the
+     value is lost here (config/Preference) or later (VideoSetSetting ->
+     VIDVulkan::SetSettingValue, which logs its own VKSET line).
+     0 Native, 1 4x, 2 2x, 3 Original, 4 720p, 5 1080p. */
+  fprintf(stderr, "YINIT: Resolution from config = %d (cli default %d)\n",
+          yinit.resolution_mode, g_resolution_mode);
+  fflush(stderr);
   yinit.rotate_screen = pre.getBool( "Rotate screen" , false );
   yinit.scsp_sync_count_per_frame = g_scsp_sync;
   yinit.extend_backup = 1;
@@ -458,11 +534,136 @@ int yabauseinit()
   padmode = inputmng->getCurrentPadMode( 0 );
 #if !defined(__PC__)  
   OSDInit(0);
+#if defined(YABA_VULKAN_ONLY)
+  OSDChangeCore(OSDCORE_NANOVG_VULKAN);
+#else
   OSDChangeCore(OSDCORE_NANOVG);
+#endif
 #endif
   LogStart();
   LogChangeOutput(DEBUG_CALLBACK, NULL);
   return 0;
+}
+
+/* ---- scripted input (instrumentation, rig/test use) -------------------------------------------------------------
+   YABA_INPUT_SCRIPT="1500:RETURN:d,1510:RETURN:u,..."  -> at emulation frame N, press (d) or release (u) a key.
+   The emulation is deterministic, so the same script reaches the same game scene every time; this is how the offline
+   rig gets into scenes (game start, race start) that attract mode never shows. Keys: RETURN UP DOWN LEFT RIGHT
+   z(A) x(B) c(C) a(X) s(Y) d(Z) q(L) e(R), as mapped by the keyboard fallback in InputManager.cpp. */
+#include <vector>
+#include <string>
+/* ---- built-in sampling profiler (rig only; x86-64 Linux; YABA_PROFILE=1) ----------------------------------------
+   SIGPROF every ~1 ms of process CPU time records (thread id, program counter). Written at exit as lines "PROF tid pc"
+   plus "PROFBASE <load address of the main binary>", for offline symbolisation (nm/addr2line). Samples in other
+   libraries (lavapipe, libc...) fall outside the binary's range and are simply dropped by the post-processing. */
+#if defined(__x86_64__) && defined(__linux__)
+#include <signal.h>
+#include <sys/time.h>
+#include <ucontext.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+static const int PROF_MAX = 400000;
+static unsigned long g_profPc[PROF_MAX];
+static int g_profTid[PROF_MAX];
+static volatile int g_profN = 0;
+static void ProfHandler(int, siginfo_t *, void * ctx) {
+  ucontext_t * uc = (ucontext_t *)ctx;
+  int n = g_profN;
+  if (n < PROF_MAX) { g_profPc[n] = (unsigned long)uc->uc_mcontext.gregs[REG_RIP]; g_profTid[n] = (int)syscall(SYS_gettid); g_profN = n + 1; }
+}
+static void ProfDump(void) {
+  FILE * f = fopen("/perf/prof.txt", "w"); if (!f) return;
+  FILE * m = fopen("/proc/self/maps", "r"); char line[512]; unsigned long base = 0;
+  if (m) { while (fgets(line, sizeof(line), m)) { if (strstr(line, "/yabasanshiro")) { sscanf(line, "%lx-", &base); break; }   /* first mapping of the image = load address */ } fclose(m); }
+  fprintf(f, "PROFBASE %lx\nPROFMAINTID %d\n", base, (int)syscall(SYS_gettid));
+  for (int i = 0; i < g_profN; i++) fprintf(f, "PROF %d %lx\n", g_profTid[i], g_profPc[i]);
+  fclose(f);
+}
+static long g_profFrom = -1;
+static void ProfStart(void) {
+  const char * e = getenv("YABA_PROFILE"); if (!e || !*e || e[0] == '0') return;
+  if (g_profFrom < 0) { const char * f = getenv("YABA_PROFILE_FROM"); g_profFrom = f ? atol(f) : 0; }
+  if (g_profFrom > 0) { g_profFrom = -(g_profFrom + 1); return; }   /* armed later by ProfArm() at that frame */
+  struct sigaction sa; memset(&sa, 0, sizeof(sa)); sa.sa_sigaction = ProfHandler; sa.sa_flags = SA_SIGINFO | SA_RESTART; sigaction(SIGPROF, &sa, NULL);
+  struct itimerval it; it.it_interval.tv_sec = 0; it.it_interval.tv_usec = 1000; it.it_value = it.it_interval; setitimer(ITIMER_PROF, &it, NULL);
+  atexit(ProfDump); printf("PROFILE: sampling every 1 ms\n");
+}
+static void ProfArm(unsigned frame) {
+  if (g_profFrom < -1 && (long)frame >= -(g_profFrom + 1)) { g_profFrom = 0; ProfStart(); }
+}
+#else
+static void ProfStart(void) {}
+static void ProfArm(unsigned) {}
+#endif
+
+struct InputScriptEv { unsigned frame; unsigned key; bool down; };
+static std::vector<InputScriptEv> g_inputScript;
+static size_t g_inputScriptPos = 0;
+static unsigned g_inputFrame = 0;
+static bool g_inputScriptInit = false;
+static unsigned InputScriptKey(const std::string & k) {
+  if (k == "RETURN") return SDLK_RETURN; if (k == "UP") return SDLK_UP; if (k == "DOWN") return SDLK_DOWN;
+  if (k == "LEFT") return SDLK_LEFT; if (k == "RIGHT") return SDLK_RIGHT;
+  if (k.size() == 1) return (unsigned)k[0];
+  return 0;
+}
+/* Test hook (rig): YABA_MENU_TEST="open@120,down,down,right,a,b,..." opens the text menu at emulation frame 120 and then feeds one token per few menu frames
+   ("up","down","left","right","a","b","close"). Used with YABA_VK_FRAMEDUMP to look at the menu without a handheld. Off unless the variable is set. */
+Uint32 g_evToggleMenu = 0;
+static std::vector<std::string> g_menuTest;
+static size_t g_menuTestPos = 0;
+static long g_menuTestOpenAt = -1;
+static void MenuTestInit() {
+  static bool done = false; if (done) return; done = true;
+  const char * e = getenv("YABA_MENU_TEST"); if (!e || !*e) return;
+  std::string str(e); size_t pos = 0;
+  while (pos < str.size()) {
+    size_t end = str.find(',', pos); if (end == std::string::npos) end = str.size();
+    std::string tok = str.substr(pos, end - pos); pos = end + 1;
+    if (tok.compare(0, 5, "open@") == 0) g_menuTestOpenAt = atol(tok.c_str() + 5); else g_menuTest.push_back(tok);
+  }
+  printf("MENUTEST: open at frame %ld, %zu tokens\n", g_menuTestOpenAt, g_menuTest.size());
+}
+static void InputScriptStep(void) {
+  MenuTestInit();
+  if (g_menuTestOpenAt >= 0 && (long)g_inputFrame == g_menuTestOpenAt && g_evToggleMenu != 0) {
+    SDL_Event ev = {}; ev.type = g_evToggleMenu; SDL_PushEvent(&ev); printf("MENUTEST: opening the menu at frame %u\n", g_inputFrame); g_menuTestOpenAt = -1;
+  }
+  if (!g_inputScriptInit) {
+    g_inputScriptInit = true;
+    ProfStart();
+    const char * e = getenv("YABA_INPUT_SCRIPT");
+    if (e && *e) {
+      std::string str(e); size_t pos = 0;
+      while (pos < str.size()) {
+        size_t end = str.find(',', pos); if (end == std::string::npos) end = str.size();
+        std::string item = str.substr(pos, end - pos); pos = end + 1;
+        size_t c1 = item.find(':'), c2 = item.find(':', c1 + 1);
+        if (c1 == std::string::npos || c2 == std::string::npos) continue;
+        InputScriptEv ev; ev.frame = (unsigned)atoi(item.substr(0, c1).c_str());
+        ev.key = InputScriptKey(item.substr(c1 + 1, c2 - c1 - 1)); ev.down = (item[c2 + 1] == 'd');
+        if (ev.key) g_inputScript.push_back(ev);
+      }
+      printf("INPUTSCRIPT: %zu events loaded\n", g_inputScript.size());
+    }
+  }
+  ProfArm(g_inputFrame);
+  while (g_inputScriptPos < g_inputScript.size() && g_inputScript[g_inputScriptPos].frame <= g_inputFrame) {
+    const InputScriptEv & ev = g_inputScript[g_inputScriptPos++];
+    printf("INPUTSCRIPT: frame %u key %u %s\n", g_inputFrame, ev.key, ev.down ? "down" : "up");
+    /* Both spellings: real SDL key events arrive as sym|0x80000000 (InputManager.cpp KEYBOARD_MASK), the no-joystick
+       defaults are registered without the mask. Whichever is mapped reacts; the other finds no entry. */
+    if (ev.down) { PerKeyDown(ev.key); PerKeyDown(ev.key | 0x80000000u); }
+    else         { PerKeyUp(ev.key);   PerKeyUp(ev.key | 0x80000000u); }
+  }
+  g_inputFrame++;
+  {
+    /* Test hook: YABA_EXIT_AFTER=N leaves through exit(0) after N emulation frames, so profiling builds (gprof writes
+       gmon.out only on a normal exit) and sanitizers can finish cleanly instead of being killed by a timeout. */
+    static long exit_after = -2;
+    if (exit_after == -2) { const char * e = getenv("YABA_EXIT_AFTER"); exit_after = e ? atol(e) : -1; }
+    if (exit_after > 0 && (long)g_inputFrame >= exit_after) { printf("EXITAFTER: %ld frames, leaving\n", exit_after); fflush(NULL); _exit(0); /* same as the real quit path (_exit at the end of main): no library teardown while the render thread is still running */ }
+  }
 }
 
 int main(int argc, char** argv)
@@ -473,6 +674,28 @@ int main(int argc, char** argv)
      Must come before SDL_Init(). */
   setenv("SDL_VIDEO_EGL_DRIVER", "libEGL.so",    0);
   setenv("SDL_VIDEO_GL_DRIVER",  "libGLESv2.so", 0);
+
+  /* Tester log: if the file ~/.yabasanshiro/ENABLE_LOG exists, write the emulator's log and the per-frame / per-second performance CSVs to
+     ~/.yabasanshiro/logs/ so a bug report can attach them. Off by default. A launcher that already redirected the output to a file
+     (stdout is a regular file) or already set YABA_PERF_LOG keeps its own choice. */
+  {
+    const char * home = getenv("HOME");
+    if (home && home[0]) {
+      std::string base = std::string(home) + "/.yabasanshiro";
+      struct stat st;
+      if (stat((base + "/ENABLE_LOG").c_str(), &st) == 0) {
+        const std::string dir = base + "/logs";
+        mkdir(dir.c_str(), 0755);
+        setenv("YABA_PERF_LOG", dir.c_str(), 0);
+        struct stat so;
+        const bool alreadyFile = (fstat(1, &so) == 0 && S_ISREG(so.st_mode));
+        if (!alreadyFile) {
+          const std::string lf = dir + "/yabasanshiro-pirry-vulkan.log";
+          if (freopen(lf.c_str(), "w", stdout) != NULL) { dup2(fileno(stdout), 2); setvbuf(stdout, NULL, _IOLBF, 0); }
+        }
+      }
+    }
+  }
 
   inputmng = InputManager::getInstance();
   
@@ -489,6 +712,7 @@ int main(int argc, char** argv)
   strcpy( buppath, bckup_dir.c_str() );
   strcpy( s_savepath, home_dir.c_str() );
   g_keymap_filename = home_dir + "keymapv2.json";
+  fprintf(stderr, "VERSION: yabasanshiro-pirry-vulkan %s (pirry base %s)\n", YABA_VULKAN_FORK_VERSION, YABA_PIRRY_BASE_VERSION);
 
   std::string current_exec_name = argv[0]; // Name of the current exec program
   std::vector<std::string> all_args;
@@ -536,7 +760,7 @@ int main(int argc, char** argv)
       g_frame_skip_cli = 0;   /* command line wins over the config */
     }
 		else if(( x == "-v" || x == "--version") ) {
-      printf("YabaSanshiro version %s(%s)\n",YAB_VERSION, GIT_SHA1 );
+      printf("yabasanshiro-pirry-vulkan %s (pirry base %s)\nYabaSanshiro version %s(%s)\n", YABA_VULKAN_FORK_VERSION, YABA_PIRRY_BASE_VERSION, YAB_VERSION, GIT_SHA1 );
       return 0;
     }
 	}
@@ -656,8 +880,17 @@ int main(int argc, char** argv)
 #else
   int width = dsp.w;
   int height = dsp.h;
+  /* SDL_WINDOW_VULKAN instead of SDL_WINDOW_OPENGL in the Vulkan build: SDL
+     then sets up a Vulkan-capable surface on its KMSDRM backend, and keeps
+     being the single owner of the KMS plane. */
   wnd = SDL_CreateWindow("Yaba Snashiro", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-      width, height, SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN | SDL_WINDOW_FULLSCREEN_DESKTOP);
+      width, height,
+#if defined(YABA_VULKAN_ONLY)
+      SDL_WINDOW_VULKAN
+#else
+      SDL_WINDOW_OPENGL
+#endif
+      | SDL_WINDOW_SHOWN | SDL_WINDOW_FULLSCREEN_DESKTOP);
   if(wnd == nullptr ) {
     printf("Fail to SDL_CreateWindow Bye! (%s)", SDL_GetError() );
     return -1;
@@ -667,17 +900,33 @@ int main(int argc, char** argv)
   SDL_SetWindowDisplayMode(wnd,&dsp);
   SDL_GetWindowSize(wnd,&width,&height);
   SDL_SetWindowInputFocus(wnd);
+#if !defined(YABA_VULKAN_ONLY)
   glc = SDL_GL_CreateContext(wnd);
   if(glc == nullptr ) {
     printf("Fail to SDL_GL_CreateContext Bye! (%s)", SDL_GetError() );
     return -1;
   }
+#endif
 
 
   inputmng->init(g_keymap_filename);
+  /* The in-game menu is nanogui-sdl, which builds its NanoVG context on
+     OpenGL (screen.cpp:271 throws "Could not initialize NanoVG!" without a GL
+     context). The Vulkan build has no GL context, so the menu is left out for
+     now and `menu` stays null; every dereference below is guarded. Restoring
+     it means porting nanogui-sdl onto nanovg_vulkan (OSDNnovgVulkan already
+     exists for the OSD, but nanogui itself is GL-only). */
+#if !defined(YABA_VULKAN_ONLY)
   menu = new MenuScreen(wnd,width,height, g_keymap_filename, cdpath);
-  menu->setConfigFile(g_keymap_filename);  
-  menu->setCurrentGamePath(cdpath);
+  menu->setConfigFile(g_keymap_filename);
+  if (menu) menu->setCurrentGamePath(cdpath);
+#else
+  /* Must happen AFTER SDL_CreateWindow (the surface backend asks SDL for the
+     window via YabaGetSDLWindow) and BEFORE yabauseinit(), which is what
+     calls VIDVulkanInit(). */
+  VIDVulkanSetupRenderer(width, height);
+  textmenu = new TextMenu(cdpath, cdpath);
+#endif
 
   if( yabauseinit() == -1 ) {
       printf("Fail to yabauseinit Bye! (%s)", SDL_GetError() );
@@ -696,35 +945,48 @@ int main(int argc, char** argv)
   /* The thread that runs YabauseExec() is not pinned: pinning it to core 2 costs frame rate in titles whose RBG0
      rotation thread runs on a neighbouring core, and the scheduler avoids the collision by itself. */
   YabThreadSetAffinityRaw(0xFu);
+  /* No-op unless YABA_PERF_LOG names an output directory. */
+  PerfLogInit(cdpath);
   Uint32 evToggleMenu = SDL_RegisterEvents(1);
+  g_evToggleMenu = evToggleMenu;
   inputmng->setToggleMenuEventCode(evToggleMenu);
 
   Uint32  evResetMenu = SDL_RegisterEvents(1);
-  menu->setResetMenuEventCode(evResetMenu);
+  if (menu) menu->setResetMenuEventCode(evResetMenu);
 
   Uint32  evPadMenu = SDL_RegisterEvents(1);
-  menu->setTogglePadModeMenuEventCode(evPadMenu);
+  if (menu) menu->setTogglePadModeMenuEventCode(evPadMenu);
 
   Uint32  evToggleFps = SDL_RegisterEvents(1);
-  menu->setToggleFpsCode(evToggleFps);
+  if (menu) menu->setToggleFpsCode(evToggleFps);
 
   Uint32  evToggleFrameSkip = SDL_RegisterEvents(1);
-  menu->setToggleFrameSkip(evToggleFrameSkip);
+  if (menu) menu->setToggleFrameSkip(evToggleFrameSkip);
 
   Uint32  evUpdateConfig = SDL_RegisterEvents(1);
-  menu->setUpdateConfig(evUpdateConfig);
+  if (menu) menu->setUpdateConfig(evUpdateConfig);
 
   Uint32  evOpenTray = SDL_RegisterEvents(1);
-  menu->setOpenTrayMenuEventCode(evOpenTray);
+  if (menu) menu->setOpenTrayMenuEventCode(evOpenTray);
 
   Uint32  evCloseTray = SDL_RegisterEvents(1);
-  menu->setCloseTrayMenuEventCode(evCloseTray);
+  if (menu) menu->setCloseTrayMenuEventCode(evCloseTray);
 
   Uint32  evSaveState = SDL_RegisterEvents(1);
-  menu->setSaveStateEventCode(evSaveState);
+  if (menu) menu->setSaveStateEventCode(evSaveState);
 
   Uint32  evLoadState = SDL_RegisterEvents(1);
-  menu->setLoadStateEventCode(evLoadState);
+  if (menu) menu->setLoadStateEventCode(evLoadState);
+  if (textmenu) {
+    textmenu->setToggleMenuEventCode(evToggleMenu);
+    textmenu->setResetMenuEventCode(evResetMenu);
+    textmenu->setSaveStateEventCode(evSaveState);
+    textmenu->setLoadStateEventCode(evLoadState);
+    textmenu->setOpenTrayMenuEventCode(evOpenTray);
+    textmenu->setCloseTrayMenuEventCode(evCloseTray);
+    textmenu->setUpdateConfig(evUpdateConfig);
+    textmenu->setKeymapFile(g_keymap_filename);
+  }
 
   std::string tmpfilename = home_dir + "tmp.png";
 
@@ -744,11 +1006,13 @@ int main(int argc, char** argv)
       if(e.type == SDL_QUIT){
         /* Only clear and swap when the main thread owns the GL context (menu open).
            Otherwise the render thread holds it and touching EGL from here can crash on exit. */
+#if !defined(YABA_VULKAN_ONLY)
         if (menu_show) {
           glClearColor(0.0,0.0,0.0,1.0);
           glClear(GL_COLOR_BUFFER_BIT);
           SDL_GL_SwapWindow(wnd);
         }
+#endif
         RA_Shutdown();
         YabauseDeInit();
         GlCleanShutdown();
@@ -763,7 +1027,24 @@ int main(int argc, char** argv)
             VIDCore->Resize(0,0,width,height,1,p->getInt("Aspect rate",0));
             delete p;
           hideMenuScreen();           
-        }else{
+        }else if (textmenu != nullptr) {
+          /* Vulkan build: the text menu. The game is paused (no YabauseExec while menu_show), the audio muted and the VDP thread revoked as in the
+             OpenGL menu; the menu frame is drawn from the main loop below. */
+          menu_show = true;
+          ScspMuteAudio(1);
+          VdpRevoke();
+          char pngname_base_t[256];
+          snprintf(pngname_base_t,256,"%s/%s_", s_savepath, cdip->itemnum);
+          textmenu->setCurrentGameId(pngname_base_t);
+          textmenu->setCurrentGamePath(cdpath);
+          textmenu->onOpen();
+          inputmng->setMenuLayer(textmenu);
+          event_count = 1;
+        }else if (menu != nullptr) {
+          /* The whole open path is GL: saveScreenshot() plus the raw
+             glUseProgram/glBindBuffer/glDisable calls below. The Vulkan build
+             has no menu and no GL context, so the hotkey must do nothing
+             instead of calling GL entry points with no current context. */
           menu_show = true;
           ScspMuteAudio(1);
 
@@ -775,7 +1056,7 @@ int main(int argc, char** argv)
 
           char pngname_base[256];
           snprintf(pngname_base,256,"%s/%s_", s_savepath, cdip->itemnum);
-          menu->setCurrentGameId(pngname_base);
+          if (menu) menu->setCurrentGameId(pngname_base);
 
           inputmng->setMenuLayer(menu);
           SDL_GL_MakeCurrent(wnd,glc);
@@ -793,7 +1074,7 @@ int main(int argc, char** argv)
           glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);   
 
            SDL_ShowCursor(SDL_ENABLE);
-          menu->setBackGroundImage( tmpfilename );
+          if (menu) menu->setBackGroundImage( tmpfilename );
         }
       }
 
@@ -832,7 +1113,7 @@ int main(int argc, char** argv)
         hideMenuScreen();         
       }
       else if(e.type == evOpenTray ){
-        menu->setCurrentGamePath(cdpath);
+        if (menu) menu->setCurrentGamePath(cdpath);
         Cs2ForceOpenTray();
         if( !g_emulated_bios ) {
           hideMenuScreen();            
@@ -859,7 +1140,7 @@ int main(int argc, char** argv)
         if( ret == 0 ){
           char pngname[256];
           snprintf(pngname,256,"%s/%s_%d.png", s_savepath, cdip->itemnum, e.user.code);
-          fs::copy(tmpfilename, pngname, fs::copy_options::overwrite_existing );
+          { std::error_code ec_png; fs::copy(tmpfilename, pngname, fs::copy_options::overwrite_existing, ec_png); }   /* no screenshot exists in the Vulkan build */
         }
         hideMenuScreen();
       }
@@ -897,7 +1178,7 @@ int main(int argc, char** argv)
 
       inputmng->parseEvent(e);
       if( menu_show ){
-        menu->onEvent( e );
+        if (menu) menu->onEvent( e );
       }
     }
     inputmng->handleJoyEvents();
@@ -905,26 +1186,67 @@ int main(int argc, char** argv)
     if( menu_show ){
 
       RA_Idle();
+#if defined(YABA_VULKAN_ONLY)
+      {
+        static Uint32 last_menu_draw = 0;
+        const Uint32 now_ms = SDL_GetTicks();
+        if (textmenu != nullptr && (event_count > 0 || now_ms - last_menu_draw > 250)) { DrawTextMenu(); last_menu_draw = now_ms; }
+        else usleep( 16*1000 );
+        /* test hook: one scripted token every few menu frames */
+        static int test_delay = 0;
+        if (textmenu != nullptr && g_menuTestPos < g_menuTest.size() && ++test_delay >= 6) {
+          test_delay = 0;
+          std::string tok = g_menuTest[g_menuTestPos++];
+          printf("MENUTEST: token %s\n%s", tok.c_str(), textmenu->dump().c_str());
+          if (tok == "close") { SDL_Event ev = {}; ev.type = g_evToggleMenu; SDL_PushEvent(&ev); }
+          else if (tok.compare(0, 4, "raw:") == 0) {
+            /* raw:<type>:<id>[:<value>] feeds the Controls page capture like a real button press, e.g. raw:button:5, raw:key:97, raw:hat:0:1 */
+            std::string rest = tok.substr(4); std::string t = rest.substr(0, rest.find(':')); int id = 0, val = 1;
+            size_t c1 = rest.find(':'); if (c1 != std::string::npos) { id = atoi(rest.c_str() + c1 + 1); size_t c2 = rest.find(':', c1 + 1); if (c2 != std::string::npos) val = atoi(rest.c_str() + c2 + 1); }
+            int r = textmenu->onRawInputEvent(*inputmng, t == "key" ? "-1_Keyboard_-1" : "0_testpad_x", t, id, val);
+            printf("MENUTEST: raw %s -> %d\n", tok.c_str(), r);
+          }
+          else if (tok == "wait") { /* just let time pass (capture timeout / 250 ms start guard) */ SDL_Delay(300); }
+          else textmenu->keyboardEvent(tok, 0, 1, 0);
+          event_count = 1; last_menu_draw = 0;
+        }
+      }
+#else
       if( event_count > 0 ){
         glClearColor(0.0f, 0.0f, 0.0f, 1);
         glClear(GL_COLOR_BUFFER_BIT);
-        menu->drawAll();
+        if (menu) menu->drawAll();
         SDL_GL_SwapWindow(wnd);
       }else{
         usleep( 16*1000 );
       }
+#endif
     }else{
       //printf("Frmae = %d \n", 0, 0, frame_cont);
       //frame_cont++;
+      InputScriptStep();   /* test hook: scripted key presses by frame number (YABA_INPUT_SCRIPT), off by default */
+      PerfFrameBegin();
       YabauseExec(); // exec one frame
+      PerfFrameEnd();
       RA_DoFrame();
     }
   }
   RA_Shutdown();
+  PerfLogShutdown();
   YabauseDeInit();
   GlCleanShutdown();
   return 0;
 }
+
+#if defined(YABA_VULKAN_ONLY)
+static void DrawTextMenu() {
+  std::string title, footer; std::vector<TextMenu::Row> rows; int sel = 0;
+  textmenu->getView(title, rows, sel, footer);
+  std::vector<VkMenuRow> r(rows.size());
+  for (size_t i = 0; i < rows.size(); i++) { r[i].label = rows[i].label.c_str(); r[i].value = rows[i].value.c_str(); r[i].selectable = rows[i].selectable ? 1 : 0; }
+  VIDVulkanDrawMenu(title.c_str(), r.data(), (int)r.size(), sel, footer.c_str());
+}
+#endif
 
 void hideMenuScreen(){
   /* A second call without an open menu (e.g. Next Disc with a real BIOS
@@ -934,6 +1256,12 @@ void hideMenuScreen(){
   SDL_ShowCursor(SDL_DISABLE);
   menu_show = false;
   inputmng->setMenuLayer(nullptr);
+#if defined(YABA_VULKAN_ONLY)
+  /* Vulkan: nothing to clear or swap here; the next emulated frame redraws the screen. */
+  VdpResume();
+  ScspUnMuteAudio(1);
+  return;
+#endif
   glClearColor(0.0f, 0.0f, 0.0f, 1);
   glClear(GL_COLOR_BUFFER_BIT);
   SDL_GL_SwapWindow(wnd);          

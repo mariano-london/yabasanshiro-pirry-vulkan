@@ -47,6 +47,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #include <stdlib.h>
 #include "yabause.h"
 #include "vdp1.h"
+#include "perflog.h"
 #include "debug.h"
 #include "scu.h"
 #include "vdp2.h"
@@ -239,6 +240,13 @@ extern "C" void FASTCALL Vdp1RamWriteLong(u32 addr, u32 val) {
    VRAM lock is not needed there. Taking it would make the emulation thread wait for the renderer on every
    read. */
 extern "C" int YabIsRenderThread(void);
+/* yabasanshiro-pirry-vulkan: the shortcut above is only valid for the OpenGL core, where VIDOGLVdp1ReadFrameBuffer reads the CPU copy outside the render
+   thread. The Vulkan core's readFrameBuffer does GPU work (a blit out of the colour attachment and a queue wait) on resources the render thread is also using,
+   so it keeps the VRAM lock (Burning Rangers crashed with a segfault on the 1.6.3 shortcut). */
+#ifndef VIDCORE_VULKAN
+#define VIDCORE_VULKAN 4   /* same value as vulkan/VIDVulkanCInterface.h */
+#endif
+#define VDP1_READ_NEEDS_LOCK() (VIDCore->id == VIDCORE_VULKAN || YabIsRenderThread())
 extern "C" u8 FASTCALL Vdp1FrameBufferReadByte(u32 addr) {
    addr &= 0x3FFFF;
    //if (VIDCore->Vdp1ReadFrameBuffer && addr < 0x30000 ){
@@ -257,7 +265,7 @@ extern "C" u16 FASTCALL Vdp1FrameBufferReadWord(u32 addr) {
    addr &= 0x3FFFF;
    if (VIDCore->Vdp1ReadFrameBuffer ){
      u16 val;
-     if (!YabIsRenderThread()) { VIDCore->Vdp1ReadFrameBuffer(1, addr, &val); return val; }
+     if (!VDP1_READ_NEEDS_LOCK()) { VIDCore->Vdp1ReadFrameBuffer(1, addr, &val); return val; }
      VdpLockVram();
      VIDCore->Vdp1ReadFrameBuffer(1, addr, &val);
      VdpUnLockVram();
@@ -272,7 +280,7 @@ extern "C" u32 FASTCALL Vdp1FrameBufferReadLong(u32 addr) {
    addr &= 0x3FFFF;
    if (VIDCore->Vdp1ReadFrameBuffer ){
      u32 val;
-     if (!YabIsRenderThread()) { VIDCore->Vdp1ReadFrameBuffer(2, addr, &val); return val; }
+     if (!VDP1_READ_NEEDS_LOCK()) { VIDCore->Vdp1ReadFrameBuffer(2, addr, &val); return val; }
      VdpLockVram();
      VIDCore->Vdp1ReadFrameBuffer(2, addr, &val);
      VdpUnLockVram();
@@ -643,6 +651,17 @@ extern "C" void FASTCALL Vdp1WriteLong(u32 addr, UNUSED u32 val) {
 
 extern "C" void Vdp1DrawCommands(u8 * ram, Vdp1 * regs, u8* back_framebuffer)
 {
+  /* The VDP1 command-chain walk, instrumented at the definition rather than
+     at a call site: it is reached from several paths (vdp1.cpp:600,
+     vdp2.cpp:1893/1900, and Vdp1Draw) and an earlier attempt hooked
+     VDPEV_DIRECT_DRAW, which this title never fires, so the column read 0.
+     A scope guard covers every return path, of which there are many. */
+  struct Vdp1PerfScope {
+    long long t0;
+    Vdp1PerfScope() : t0(g_perf_on ? PerfNowNs() : 0) {}
+    ~Vdp1PerfScope() { if (g_perf_on) PerfAddVdp1DrawNs(PerfNowNs() - t0); }
+  } _vdp1_perf_scope;
+
   std::unique_lock<std::mutex> lk(vdp1_clock_mtx);
   LOG("VDP1: DrawCommands - %08X\n", regs->addr);
   regs->COPR = regs->addr >> 3;

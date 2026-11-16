@@ -70,8 +70,25 @@ void AddRequiredPlatformInstanceExtensions(std::vector<const char *> *instance_e
 #include <android/native_window.h> // requires ndk r5 or newer
 #include <android/native_window_jni.h> // requires ndk r5 or newer
 
-// LINUX ( Via XCB library )
+// LINUX
 #elif defined( __linux )
+
+// SDL2 surface. Preferred on handhelds such as the RK3566 ones running
+// dArkOS: no X server and no Wayland compositor, and SDL already owns the KMS
+// plane (it takes DRM master), so SDL's own KMSDRM Vulkan backend is the only
+// way to get a surface without fighting it for the display.
+#if defined( YAB_VK_SDL )
+
+#define VK_USE_PLATFORM_SDL_KHR 1
+
+// Direct-to-display (KMS/DRM), no window system at all. Only correct if the
+// front end does NOT create an SDL video window, otherwise the two contend
+// for the same display. Kept as a fallback.
+#elif defined( YAB_VK_DISPLAY )
+
+#define VK_USE_PLATFORM_DISPLAY_KHR 1
+
+#else
 // there are other ways to create windows on linux,
 // requirements might change based on the available libraries and distro used
 // for example: xlib, wayland and mir
@@ -79,6 +96,8 @@ void AddRequiredPlatformInstanceExtensions(std::vector<const char *> *instance_e
 
 #define VK_USE_PLATFORM_XCB_KHR 1
 #include <xcb/xcb.h>
+
+#endif
 
 #else
 // platform not yet supported

@@ -62,6 +62,8 @@ set(yabause_ra_SOURCES
 	InputConfig.cpp
 	MenuScreen.h
     MenuScreen.cpp
+    TextMenu.h
+    TextMenu.cpp
     Preference.h
     Preference.cpp
     RetroAchievements.cpp

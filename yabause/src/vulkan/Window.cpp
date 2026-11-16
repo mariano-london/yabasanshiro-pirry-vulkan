@@ -31,9 +31,13 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #include "Window.h"
 #include "Renderer.h"
 #include "Shared.h"
+#include "RenderPassDeps.h"
 
 #include <assert.h>
 #include <array>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 #include "VulkanTools.h"
 
@@ -59,7 +63,8 @@ Window::Window( Renderer * renderer, uint32_t size_x, uint32_t size_y, std::stri
 
 Window::~Window()
 {
-	vkQueueWaitIdle( _renderer->GetVulkanQueue() );
+	YABA_QIDLE(YabaQueueWaitIdle( _renderer->GetVulkanQueue() ));
+	_DeInitFrameDump();
 	_DeInitSynchronizations();
 	_DeInitFramebuffers();
 	_DeInitRenderPass();
@@ -120,14 +125,154 @@ int Window::BeginRender()
 		&_active_swapchain_image_id ) );
 	ErrorCheck( vkWaitForFences( _renderer->GetVulkanDevice(), 1, &_swapchain_image_available, VK_TRUE, UINT64_MAX ) );
 	ErrorCheck( vkResetFences( _renderer->GetVulkanDevice(), 1, &_swapchain_image_available ) );
-	ErrorCheck( vkQueueWaitIdle( _renderer->GetVulkanQueue() ) );
+	{ const long long _qi0 = PerfNowNs(); ErrorCheck( YabaQueueWaitIdle( _renderer->GetVulkanQueue() ) ); PerfAddVk(4, PerfNowNs() - _qi0); }
 
   return _active_swapchain_image_id;
+}
+
+bool Window::_DumpFrame(const std::vector<VkSemaphore> & wait_semaphores)
+{
+	VkDevice dev = _renderer->GetVulkanDevice();
+	const uint32_t w = _surface_size_x, h = _surface_size_y;
+	if( _fd_buf == VK_NULL_HANDLE ) {
+		_fd_size = (VkDeviceSize)w * h * 4;
+		VkBufferCreateInfo bi {};
+		bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+		bi.size = _fd_size;
+		bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+		bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+		ErrorCheck( vkCreateBuffer( dev, &bi, nullptr, &_fd_buf ) );
+  YABA_VK_NAME(dev, VK_OBJECT_TYPE_BUFFER, _fd_buf, "_fd_buf");
+		VkMemoryRequirements mr;
+		vkGetBufferMemoryRequirements( dev, _fd_buf, &mr );
+		VkMemoryAllocateInfo ai {};
+		ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+		ai.allocationSize = mr.size;
+		ai.memoryTypeIndex = FindMemoryTypeIndex( &_renderer->GetVulkanPhysicalDeviceMemoryProperties(), &mr,
+			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT );
+		ErrorCheck( vkAllocateMemory( dev, &ai, nullptr, &_fd_mem ) );
+		ErrorCheck( vkBindBufferMemory( dev, _fd_buf, _fd_mem, 0 ) );
+		VkCommandPoolCreateInfo pi {};
+		pi.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+		pi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+		pi.queueFamilyIndex = _renderer->GetVulkanGraphicsQueueFamilyIndex();
+		ErrorCheck( vkCreateCommandPool( dev, &pi, nullptr, &_fd_pool ) );
+		VkSemaphoreCreateInfo si {};
+		si.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+		ErrorCheck( vkCreateSemaphore( dev, &si, nullptr, &_fd_sem ) );
+		VkFenceCreateInfo fi {};
+		fi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+		ErrorCheck( vkCreateFence( dev, &fi, nullptr, &_fd_fence ) );
+	}
+	VkCommandBufferAllocateInfo cai {};
+	cai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+	cai.commandPool = _fd_pool;
+	cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+	cai.commandBufferCount = 1;
+	VkCommandBuffer cb;
+	ErrorCheck( vkAllocateCommandBuffers( dev, &cai, &cb ) );
+	VkCommandBufferBeginInfo bgi {};
+	bgi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+	bgi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+	ErrorCheck( vkBeginCommandBuffer( cb, &bgi ) );
+	VkImage img = _swapchain_images[ _active_swapchain_image_id ];
+	VkImageMemoryBarrier b {};
+	b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+	b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	b.image = img;
+	b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+	b.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+	b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+	b.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+	b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+	vkCmdPipelineBarrier( cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b );
+	VkBufferImageCopy rg {};
+	rg.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+	rg.imageExtent = { w, h, 1 };
+	vkCmdCopyImageToBuffer( cb, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, _fd_buf, 1, &rg );
+	b.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+	b.dstAccessMask = 0;
+	b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+	b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+	vkCmdPipelineBarrier( cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &b );
+	ErrorCheck( vkEndCommandBuffer( cb ) );
+
+	std::vector<VkPipelineStageFlags> stages( wait_semaphores.size(), VK_PIPELINE_STAGE_TRANSFER_BIT );
+	VkSubmitInfo sub {};
+	sub.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+	sub.waitSemaphoreCount = wait_semaphores.size();
+	sub.pWaitSemaphores = wait_semaphores.data();
+	sub.pWaitDstStageMask = stages.data();
+	sub.commandBufferCount = 1;
+	sub.pCommandBuffers = &cb;
+	sub.signalSemaphoreCount = 1;
+	sub.pSignalSemaphores = &_fd_sem;
+	ErrorCheck( YabaQueueSubmit( _renderer->GetVulkanQueue(), 1, &sub, _fd_fence ) );
+	VkResult wr = vkWaitForFences( dev, 1, &_fd_fence, VK_TRUE, 5000000000ull );
+	vkResetFences( dev, 1, &_fd_fence );
+	vkFreeCommandBuffers( dev, _fd_pool, 1, &cb );
+	if( wr != VK_SUCCESS ) {
+		LOGI("FRAMEDUMP: copy fence wait failed (%d) at frame %llu\n", (int)wr, (unsigned long long)_fd_frame);
+		return true; /* semaphore is still signalled by the queue eventually */
+	}
+
+	void * p = nullptr;
+	if( vkMapMemory( dev, _fd_mem, 0, _fd_size, 0, &p ) == VK_SUCCESS ) {
+		const char * dir = getenv("YABA_VK_FRAMEDUMP_DIR");
+		char name[512];
+		snprintf( name, sizeof(name), "%s/frame-%06llu.ppm", dir ? dir : ".", (unsigned long long)_fd_frame );
+		FILE * f = fopen( name, "wb" );
+		if( f ) {
+			fprintf( f, "P6\n%u %u\n255\n", w, h );
+			const bool bgr = ( _surface_format.format == VK_FORMAT_B8G8R8A8_UNORM || _surface_format.format == VK_FORMAT_B8G8R8A8_SRGB );
+			const unsigned char * src = (const unsigned char *)p;
+			std::vector<unsigned char> row( (size_t)w * 3 );
+			uint64_t sum = 0;
+			for( uint32_t y = 0; y < h; ++y ) {
+				for( uint32_t x = 0; x < w; ++x ) {
+					const unsigned char * px = src + ((size_t)y * w + x) * 4;
+					row[x*3+0] = bgr ? px[2] : px[0];
+					row[x*3+1] = px[1];
+					row[x*3+2] = bgr ? px[0] : px[2];
+					sum += px[0] + px[1] + px[2];
+				}
+				fwrite( row.data(), 1, row.size(), f );
+			}
+			fclose( f );
+			/* mean brightness x1000 is a cheap numeric "is it black / did it change" metric */
+			LOGI("FRAMEDUMP: wrote %s fmt=%d mean_luma_x1000=%llu\n", name, (int)_surface_format.format,
+				(unsigned long long)( sum * 1000 / ((uint64_t)w * h * 3) ));
+		} else {
+			LOGI("FRAMEDUMP: cannot open %s\n", name);
+		}
+		vkUnmapMemory( dev, _fd_mem );
+	}
+	return true;
+}
+
+void Window::_DeInitFrameDump()
+{
+	VkDevice dev = _renderer->GetVulkanDevice();
+	if( _fd_fence ) vkDestroyFence( dev, _fd_fence, nullptr );
+	if( _fd_sem ) vkDestroySemaphore( dev, _fd_sem, nullptr );
+	if( _fd_pool ) vkDestroyCommandPool( dev, _fd_pool, nullptr );
+	if( _fd_buf ) vkDestroyBuffer( dev, _fd_buf, nullptr );
+	if( _fd_mem ) vkFreeMemory( dev, _fd_mem, nullptr );
+	_fd_fence = VK_NULL_HANDLE; _fd_sem = VK_NULL_HANDLE; _fd_pool = VK_NULL_HANDLE;
+	_fd_buf = VK_NULL_HANDLE; _fd_mem = VK_NULL_HANDLE;
 }
 
 void Window::EndRender( std::vector<VkSemaphore> wait_semaphores )
 {
 	VkResult present_result = VkResult::VK_RESULT_MAX_ENUM;
+
+	if( _fd_every > 0 && _fd_usage_ok ) {
+		if( ( _fd_frame % (uint64_t)_fd_every ) == 0 ) {
+			_DumpFrame( wait_semaphores );
+			wait_semaphores.assign( 1, _fd_sem ); /* present waits on the copy, which waited on the render */
+		}
+		++_fd_frame;
+	}
 
 	VkPresentInfoKHR present_info {};
 	present_info.sType					= VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
@@ -138,8 +283,25 @@ void Window::EndRender( std::vector<VkSemaphore> wait_semaphores )
 	present_info.pImageIndices			= &_active_swapchain_image_id;
 	present_info.pResults				= &present_result;
 
-	ErrorCheck( vkQueuePresentKHR( _renderer->GetVulkanQueue(), &present_info ) );
+	ErrorCheck( YabaQueuePresent( _renderer->GetVulkanQueue(), &present_info ) );
 	ErrorCheck( present_result );
+}
+
+void Window::RecordPresentTransition( VkCommandBuffer cmd )
+{
+	/* Single place where the swapchain image goes to PRESENT_SRC_KHR (the render passes leave it in
+	   COLOR_ATTACHMENT_OPTIMAL). Must be recorded after the last pass and before vkEndCommandBuffer. */
+	VkImageMemoryBarrier b {};
+	b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+	b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	b.image = _swapchain_images[ _active_swapchain_image_id ];
+	b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+	b.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+	b.dstAccessMask = 0;
+	b.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+	vkCmdPipelineBarrier( cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+		0, 0, nullptr, 0, nullptr, 1, &b );
 }
 
 VkRenderPass Window::GetVulkanRenderPass()
@@ -187,6 +349,11 @@ void Window::_InitSurface()
 		_surface_size_y			= _surface_capabilities.currentExtent.height;
 	}
 	LOGI("%s %d,%d","vkGetPhysicalDeviceSurfaceCapabilitiesKHR out",_surface_size_x,_surface_size_y );
+	LOGI("SURFACE supportedUsageFlags=0x%x (TRANSFER_SRC=%d TRANSFER_DST=%d) minImages=%u maxImages=%u currentTransform=0x%x\n",
+		(unsigned)_surface_capabilities.supportedUsageFlags,
+		(_surface_capabilities.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)?1:0,
+		(_surface_capabilities.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT)?1:0,
+		_surface_capabilities.minImageCount,_surface_capabilities.maxImageCount,(unsigned)_surface_capabilities.currentTransform);
 
 	{
 		uint32_t format_count = 0;
@@ -202,12 +369,25 @@ void Window::_InitSurface()
 
 		LOGI("%s","vkGetPhysicalDeviceSurfaceFormatsKHR In");
 		ErrorCheck( vkGetPhysicalDeviceSurfaceFormatsKHR( gpu, _surface, &format_count, formats.data() ) );
+		for( uint32_t fi = 0; fi < format_count; ++fi )
+			LOGI("SURFACE format[%u] = %d colorSpace=%d\n", fi, (int)formats[ fi ].format, (int)formats[ fi ].colorSpace );
 		if( formats[ 0 ].format == VK_FORMAT_UNDEFINED ) {
 			_surface_format.format		= VK_FORMAT_B8G8R8A8_UNORM;
 			_surface_format.colorSpace	= VK_COLORSPACE_SRGB_NONLINEAR_KHR;
 		} else {
 			_surface_format				= formats[ 0 ];
+			/* Prefer a UNORM format: the emulator writes display-referred colours, so an _SRGB attachment would
+			   gamma-encode them a second time. First choice RGBA8 UNORM, then BGRA8 UNORM, else whatever came first. */
+			const VkFormat prefer[] = { VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM };
+			bool picked = false;
+			for( VkFormat want : prefer ) {
+				for( uint32_t fi = 0; fi < format_count && !picked; ++fi ) {
+					if( formats[ fi ].format == want ) { _surface_format = formats[ fi ]; picked = true; }
+				}
+				if( picked ) break;
+			}
 		}
+		LOGI("SURFACE chosen format = %d colorSpace=%d\n", (int)_surface_format.format, (int)_surface_format.colorSpace );
 		LOGI("%s","vkGetPhysicalDeviceSurfaceFormatsKHR OUT");
 	}
 }
@@ -254,6 +434,27 @@ void Window::_InitSwapchain()
 	swapchain_create_info.imageExtent.height		= _surface_size_y;
 	swapchain_create_info.imageArrayLayers			= 1;
 	swapchain_create_info.imageUsage				= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+	/* The Resolution 2x/Original path blits the sub render target INTO the swapchain image, which
+	   requires TRANSFER_DST on it (VUID-vkCmdBlitImage-dstImage-00224 / ...-oldLayout-01213). */
+	if( _surface_capabilities.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT ) {
+		swapchain_create_info.imageUsage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+		LOGI("SWAPCHAIN: TRANSFER_DST usage enabled\n");
+	} else {
+		LOGI("SWAPCHAIN: WARNING surface does not offer TRANSFER_DST; the blit path (Resolution 2x/Original) cannot be valid\n");
+	}
+	{
+		const char * fd = getenv("YABA_VK_FRAMEDUMP");
+		_fd_every = fd ? atoi(fd) : 0;
+		if( _fd_every > 0 ) {
+			if( _surface_capabilities.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT ) {
+				swapchain_create_info.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+				_fd_usage_ok = true;
+				LOGI("FRAMEDUMP: enabled, every %d frames\n", _fd_every);
+			} else {
+				LOGI("FRAMEDUMP: requested but surface lacks TRANSFER_SRC; disabled\n");
+			}
+		}
+	}
 	swapchain_create_info.imageSharingMode			= VK_SHARING_MODE_EXCLUSIVE;
 	swapchain_create_info.queueFamilyIndexCount		= 0;
 	swapchain_create_info.pQueueFamilyIndices		= nullptr;
@@ -279,6 +480,7 @@ void Window::_InitSwapchainImages()
 	_swapchain_image_views.resize( _swapchain_image_count );
 
 	ErrorCheck( vkGetSwapchainImagesKHR( _renderer->GetVulkanDevice(), _swapchain, &_swapchain_image_count, _swapchain_images.data() ) );
+	for( uint32_t i=0; i < _swapchain_image_count; ++i ) YABA_VK_NAME(_renderer->GetVulkanDevice(), VK_OBJECT_TYPE_IMAGE, _swapchain_images[ i ], "swapchain_image");
 
 	for( uint32_t i=0; i < _swapchain_image_count; ++i ) {
 		VkImageViewCreateInfo image_view_create_info {};
@@ -297,6 +499,7 @@ void Window::_InitSwapchainImages()
 		image_view_create_info.subresourceRange.layerCount			= 1;
 
 		ErrorCheck( vkCreateImageView( _renderer->GetVulkanDevice(), &image_view_create_info, nullptr, &_swapchain_image_views[ i ] ) );
+  YABA_VK_NAME(_renderer->GetVulkanDevice(), VK_OBJECT_TYPE_IMAGE_VIEW, _swapchain_image_views[ i ], "_swapchain_image_views[ i ]");
 	}
 }
 
@@ -359,6 +562,7 @@ void Window::_InitDepthStencilImage()
 	image_create_info.initialLayout			= VK_IMAGE_LAYOUT_UNDEFINED;
 
 	ErrorCheck( vkCreateImage( _renderer->GetVulkanDevice(), &image_create_info, nullptr, &_depth_stencil_image ) );
+  YABA_VK_NAME(_renderer->GetVulkanDevice(), VK_OBJECT_TYPE_IMAGE, _depth_stencil_image, "_depth_stencil_image");
 
 	VkMemoryRequirements image_memory_requirements {};
 	vkGetImageMemoryRequirements( _renderer->GetVulkanDevice(), _depth_stencil_image, &image_memory_requirements );
@@ -389,6 +593,7 @@ void Window::_InitDepthStencilImage()
 	image_view_create_info.subresourceRange.layerCount		= 1;
 
 	ErrorCheck( vkCreateImageView( _renderer->GetVulkanDevice(), &image_view_create_info, nullptr, &_depth_stencil_image_view ) );
+  YABA_VK_NAME(_renderer->GetVulkanDevice(), VK_OBJECT_TYPE_IMAGE_VIEW, _depth_stencil_image_view, "_depth_stencil_image_view");
 }
 
 void Window::_DeInitDepthStencilImage()
@@ -407,8 +612,13 @@ void Window::_InitRenderPass()
   attachments[0].samples = VK_SAMPLE_COUNT_1_BIT;
   attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
   attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  /* Layout state machine for the swapchain image (was PRESENT_SRC at the end of every pass, with the
+     "keep" passes starting from UNDEFINED + LOAD, which on a tile-based GPU means "contents garbage").
+     main pass : UNDEFINED -> COLOR_ATTACHMENT_OPTIMAL   (CLEAR, so UNDEFINED is legal)
+     keep pass : COLOR_ATTACHMENT_OPTIMAL -> same        (LOAD, so the real layout must be declared)
+     The one transition to PRESENT_SRC_KHR is recorded at the end of the frame (Window::RecordPresentTransition). */
   attachments[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-  attachments[0].finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+  attachments[0].finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 
 
 	attachments[ 1 ].flags						= 0;
@@ -416,7 +626,9 @@ void Window::_InitRenderPass()
 	attachments[ 1 ].samples					= VK_SAMPLE_COUNT_1_BIT;
 	attachments[ 1 ].loadOp						= VK_ATTACHMENT_LOAD_OP_CLEAR;
 	attachments[ 1 ].storeOp					= VK_ATTACHMENT_STORE_OP_DONT_CARE;
-	attachments[ 1 ].stencilLoadOp				= VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+	/* Pipelines drawn into this pass have stencilTestEnable = TRUE (VdpPipeline.cpp), so the stencil must start
+	   defined: CLEAR (value 0 comes from the begin info), not DONT_CARE = "garbage" on a tile-based GPU. */
+	attachments[ 1 ].stencilLoadOp				= VK_ATTACHMENT_LOAD_OP_CLEAR;
 	attachments[ 1 ].stencilStoreOp				= VK_ATTACHMENT_STORE_OP_STORE;
 	attachments[ 1 ].initialLayout				= VK_IMAGE_LAYOUT_UNDEFINED;
 	attachments[ 1 ].finalLayout				= VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
@@ -438,19 +650,31 @@ void Window::_InitRenderPass()
 	sub_passes[ 0 ].pDepthStencilAttachment		= &sub_pass_0_depth_stencil_attachment;
 
 
+	/* Subpass dependencies (R4): shared with the sub render target's pass; see RenderPassDeps.h for why they must match. */
+	auto deps = YabaSceneSubpassDependencies();
+
 	VkRenderPassCreateInfo render_pass_create_info {};
 	render_pass_create_info.sType				= VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
 	render_pass_create_info.attachmentCount		= attachments.size();
 	render_pass_create_info.pAttachments		= attachments.data();
 	render_pass_create_info.subpassCount		= sub_passes.size();
 	render_pass_create_info.pSubpasses			= sub_passes.data();
+	render_pass_create_info.dependencyCount		= deps.size();
+	render_pass_create_info.pDependencies		= deps.data();
 
 	ErrorCheck( vkCreateRenderPass( _renderer->GetVulkanDevice(), &render_pass_create_info, nullptr, &_render_pass ) );
+  YABA_VK_NAME(_renderer->GetVulkanDevice(), VK_OBJECT_TYPE_RENDER_PASS, _render_pass, "_render_pass");
 
+  /* keep pass: resumes drawing on what the previous pass left, so it must declare the layout that
+     pass left (R1/R3). Depth/stencil likewise: LOAD with UNDEFINED means "garbage". */
   attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+  attachments[0].initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
   attachments[1].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+  attachments[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+  attachments[1].initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
   ErrorCheck(vkCreateRenderPass(_renderer->GetVulkanDevice(), &render_pass_create_info, nullptr, &_render_pass_keep));
+  YABA_VK_NAME(_renderer->GetVulkanDevice(), VK_OBJECT_TYPE_RENDER_PASS, _render_pass_keep, "_render_pass_keep");
 
 }
 
@@ -478,6 +702,7 @@ void Window::_InitFramebuffers()
 		framebuffer_create_info.layers			= 1;
 
 		ErrorCheck( vkCreateFramebuffer( _renderer->GetVulkanDevice(), &framebuffer_create_info, nullptr, &_framebuffers[ i ] ) );
+  YABA_VK_NAME(_renderer->GetVulkanDevice(), VK_OBJECT_TYPE_FRAMEBUFFER, _framebuffers[ i ], "_framebuffers[ i ]");
 	}
 }
 

@@ -21,6 +21,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #pragma once
 
 extern "C" {
+#include "ZeroAlloc.h"
 #include "vidshared.h"
 #include "debug.h"
 #include "vdp2.h"
@@ -41,6 +42,9 @@ using std::map;
 #define MAX_RENDER_COUNT 32
 
 class FramebufferRenderer {
+public:
+  YABA_ZERO_NEW
+private:
 public:
 
   enum ColorClacMode {
@@ -88,6 +92,7 @@ public:
   void drawWithDestAlphaMode(Vdp2 * fixVdp2Regs, VkCommandBuffer commandBuffer, int from, int to);
   void drawShadow(Vdp2 * fixVdp2Reg, VkCommandBuffer commandBuffer, int from, int to);
   void onEndFrame();
+  void prepareFrame(Vdp2 * fixVdp2Regs);
 
   void chenageResolution(int vdp2Width, int vdp2Height, int renderWidth, int renderHeight);
 

@@ -313,6 +313,70 @@ void ProfileDrawGraph() {
 }
 
 
+/* Text menu: black screen (the pass clears it), title, rows with the label left and the value right, the selected row highlighted, a footer line. */
+extern "C" void NanovgVulkanDrawTextMenu(int w, int h, const char * title, const char * const * labels, const char * const * values,
+                                         const int * selectable, int count, int selected, const char * footer) {
+  if (vg == NULL) return;
+  const float pad = w * 0.06f;
+  /* Everything scales with the panel height (720 = 1.0) so the small panels (e.g. 480x272) keep readable, fitting rows. */
+  float s = h / 720.0f; if (s < 0.5f) s = 0.5f; if (s > 1.5f) s = 1.5f;
+  const float rowH = 46.0f * s;
+  nvgBeginFrame(vg, w, h, 1.0f);
+  nvgFontFace(vg, "sans");
+
+  nvgFontSize(vg, 44.0f * s);
+  nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
+  nvgFillColor(vg, nvgRGBA(255, 200, 80, 255));
+  nvgText(vg, pad, h * 0.08f, title, NULL);
+
+  const float top = h * 0.08f + 70.0f * s;
+  const float footerY = h - 40.0f * s;
+  /* Scrolling window: only the rows that fit between the title and the footer are drawn, the selected row is always inside it, and
+     "more" markers show when rows are hidden above or below. */
+  int visible = (int)(((footerY - 50.0f * s) - (top - rowH * 0.5f)) / rowH);
+  if (visible < 3) visible = 3;
+  static int first = 0;
+  static char lastTitle[64] = "";
+  if (strncmp(lastTitle, title, sizeof(lastTitle) - 1) != 0) { first = 0; strncpy(lastTitle, title, sizeof(lastTitle) - 1); lastTitle[sizeof(lastTitle) - 1] = 0; }
+  if (selected <= first && first > 0) first = selected - 1;   /* scrolling up: keep one row of context above the selection */
+  if (selected >= first + visible) first = selected - visible + 1;
+  if (first > count - visible) first = count - visible;
+  if (first < 0) first = 0;
+  const int last = (first + visible < count) ? first + visible : count;
+
+  nvgFontSize(vg, 32.0f * s);
+  for (int i = first; i < last; i++) {
+    const float y = top + (i - first) * rowH;
+    if (i == selected) {
+      nvgBeginPath(vg);
+      nvgRoundedRect(vg, pad - 12.0f, y - rowH * 0.5f + 3.0f, w - 2 * pad + 24.0f, rowH - 6.0f, 6.0f);
+      nvgFillColor(vg, nvgRGBA(40, 90, 190, 230));
+      nvgFill(vg);
+    }
+    nvgFillColor(vg, i == selected ? nvgRGBA(255, 255, 255, 255) : (selectable[i] ? nvgRGBA(215, 215, 215, 255) : nvgRGBA(120, 120, 120, 255)));
+    nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
+    nvgText(vg, pad, y, labels[i], NULL);
+    if (values[i] != NULL && values[i][0] != 0) {
+      nvgTextAlign(vg, NVG_ALIGN_RIGHT | NVG_ALIGN_MIDDLE);
+      nvgFillColor(vg, i == selected ? nvgRGBA(255, 240, 160, 255) : nvgRGBA(150, 200, 255, 255));
+      nvgText(vg, w - pad, y, values[i], NULL);
+    }
+  }
+
+  nvgFontSize(vg, 22.0f * s);
+  nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
+  nvgFillColor(vg, nvgRGBA(170, 170, 170, 255));
+  nvgText(vg, pad, footerY, footer, NULL);
+
+  /* hidden rows: markers on the right of the title line (above) and just over the footer (below) */
+  nvgFontSize(vg, 22.0f * s);
+  nvgTextAlign(vg, NVG_ALIGN_RIGHT | NVG_ALIGN_MIDDLE);
+  nvgFillColor(vg, nvgRGBA(255, 200, 80, 255));
+  if (first > 0) nvgText(vg, w - pad, h * 0.08f, "^ more above", NULL);
+  if (last < count) nvgText(vg, w - pad, footerY - 26.0f * s, "v more below", NULL);
+  nvgEndFrame(vg);
+}
+
 extern "C" {
 
 static void OSDNanovgVDisplayMessage(OSDMessage_struct * message, pixel_t * buffer, int w, int h)

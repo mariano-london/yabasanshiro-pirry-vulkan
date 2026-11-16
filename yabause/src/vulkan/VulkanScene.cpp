@@ -19,6 +19,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 */
 
 #include "VulkanScene.h"
+#include "Shared.h"   /* YabaVkSubmit: traced queue submits */
 #include "Window.h"
 
 #define GLM_FORCE_RADIANS
@@ -156,11 +157,40 @@ void VulkanScene::createCommandPool()
   const VkDevice device = _renderer->GetVulkanDevice();
   if (device == VK_NULL_HANDLE) return;
 
+  /* Vdp2DrawStart() calls this on every video-mode change (Sega Rally switches
+     320x224 <-> 352x224 at each menu/race transition -- 81 times in one
+     measured session), so the previous frame is very likely still executing on
+     the GPU. Vulkan forbids freeing a command buffer that is still pending, or
+     destroying a pool that owns one, so the frame then records into buffers the
+     GPU is mid-way through: undefined, and in practice a corrupt frame or two
+     at the transition. endSingleTimeCommands() in this same file already waits
+     before vkFreeCommandBuffers; this path did not. */
+  if (_command_pool != VK_NULL_HANDLE) {
+    fprintf(stderr, "VKPOOL: rebuilding command pool (waiting for GPU first)\n");
+    fflush(stderr);
+    YABA_QIDLE(YabaQueueWaitIdle(_renderer->GetVulkanQueue()));
+  }
+
   if (_command_buffers.size() != 0) {
     vkFreeCommandBuffers(device, _command_pool, _command_buffers.size(), _command_buffers.data());
+    _command_buffers.clear();
   }
   if (_command_pool != VK_NULL_HANDLE) vkDestroyCommandPool(device, _command_pool, nullptr);
+  _command_pool = VK_NULL_HANDLE;
 
+  /* The semaphore was recreated on every call without the old one being
+     destroyed, leaking one per mode change. VIDVulkan::present() waits on it,
+     so it must not be destroyed while a submit still references it -- the wait
+     above covers that. */
+  /* A/B switch for the device (no rebuild needed): YABA_VK_KEEP_SEM=1 keeps the existing semaphore instead of
+     destroying and re-creating it on every mode change. This semaphore is the prime suspect if transition
+     artifacts persist; the rig shows both variants validation-clean, so only the device can tell them apart. */
+  static const bool keep_sem = (getenv("YABA_VK_KEEP_SEM") != nullptr && atoi(getenv("YABA_VK_KEEP_SEM")) != 0);
+  if (keep_sem) fprintf(stderr, "VKPOOL: YABA_VK_KEEP_SEM=1, render-complete semaphore is kept across pool rebuilds\n");
+  if (!keep_sem && _render_complete_semaphore != VK_NULL_HANDLE) {
+    vkDestroySemaphore(device, _render_complete_semaphore, nullptr);
+    _render_complete_semaphore = VK_NULL_HANDLE;
+  }
 
   VkCommandPoolCreateInfo pool_create_info{};
   pool_create_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
@@ -177,9 +207,11 @@ void VulkanScene::createCommandPool()
   command_buffer_allocate_info.commandBufferCount = _command_buffers.size();
   vkAllocateCommandBuffers(_renderer->GetVulkanDevice(), &command_buffer_allocate_info, _command_buffers.data());
 
-  VkSemaphoreCreateInfo semaphore_create_info{};
-  semaphore_create_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-  vkCreateSemaphore(_renderer->GetVulkanDevice(), &semaphore_create_info, nullptr, &_render_complete_semaphore);
+  if (_render_complete_semaphore == VK_NULL_HANDLE) {
+    VkSemaphoreCreateInfo semaphore_create_info{};
+    semaphore_create_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    vkCreateSemaphore(_renderer->GetVulkanDevice(), &semaphore_create_info, nullptr, &_render_complete_semaphore);
+  }
 }
 
 void VulkanScene::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, VkBuffer& buffer, VkDeviceMemory& bufferMemory) {
@@ -246,8 +278,9 @@ void VulkanScene::endSingleTimeCommands(VkCommandBuffer commandBuffer) {
   submitInfo.commandBufferCount = 1;
   submitInfo.pCommandBuffers = &commandBuffer;
 
-  vkQueueSubmit(_renderer->GetVulkanQueue(), 1, &submitInfo, VK_NULL_HANDLE);
-  vkQueueWaitIdle(_renderer->GetVulkanQueue());
+  YabaVkSubmit(device, _renderer->GetVulkanQueue(), &submitInfo,
+               "VulkanScene::endSingleTimeCommands");
+  YABA_QIDLE(YabaQueueWaitIdle(_renderer->GetVulkanQueue()));
 
   vkFreeCommandBuffers(device, _command_pool, 1, &commandBuffer);
 }

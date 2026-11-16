@@ -32,6 +32,7 @@ using json = nlohmann::json;
 
 
 #include "InputConfig.h"
+#include "MenuLayer.h"
 #include "RetroAchievements.h"
 #include <vector>
 
@@ -49,7 +50,7 @@ struct PlayerConfig {
     PopupButton *player = nullptr;
 };
 
-class MenuScreen : public nanogui::Screen
+class MenuScreen : public nanogui::Screen, public MenuLayer
 {
 public:
     //Widget *activeWindow = nullptr;

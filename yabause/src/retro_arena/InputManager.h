@@ -29,7 +29,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 class InputConfig;
 class YWindow;
 
-class MenuScreen;
+class MenuLayer;
 
 using std::string;
 
@@ -69,7 +69,7 @@ private:
 	void addJoystickByDeviceIndex(int id);
 	void removeJoystickByJoystickID(SDL_JoystickID id);
 	bool loadInputConfig(InputConfig* config); // returns true if successfully loaded, false if not (or didn't exist)
-	MenuScreen * menu_layer_ = nullptr;
+	MenuLayer * menu_layer_ = nullptr;
 
   int convertFromEmustationFile( const std::string & fname );
   pre_input_map joymap_;
@@ -99,7 +99,7 @@ public:
 	int handleJoyEventsMenu(void);
 	bool parseEventMenu(const SDL_Event& ev );
 
-	void setMenuLayer( MenuScreen * menu_layer );
+	void setMenuLayer( MenuLayer * menu_layer );
 
 
 	uint32_t showmenu_ = 0;

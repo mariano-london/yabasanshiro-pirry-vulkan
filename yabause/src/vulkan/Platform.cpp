@@ -109,4 +109,69 @@ void AddRequiredPlatformInstanceExtensions(std::vector<const char *> *instance_e
   instance_extensions->push_back(VK_KHR_XCB_SURFACE_EXTENSION_NAME);
 }
 
+#elif VK_USE_PLATFORM_SDL_KHR
+
+#include <SDL2/SDL.h>
+#include <SDL2/SDL_vulkan.h>
+#include <iostream>
+
+extern "C" SDL_Window *YabaGetSDLWindow(void);
+
+void InitPlatform()
+{
+  /* SDL_INIT_VIDEO is already done by the front end before the video core is
+     created, so there is nothing to initialise. The loader does need to be
+     pulled in before any vk* call, though. */
+  if (SDL_Vulkan_LoadLibrary(nullptr) != 0) {
+    std::cerr << "SDL_Vulkan_LoadLibrary failed: " << SDL_GetError() << "\n";
+  }
+}
+
+void DeInitPlatform()
+{
+  SDL_Vulkan_UnloadLibrary();
+}
+
+void AddRequiredPlatformInstanceExtensions(std::vector<const char *> *instance_extensions)
+{
+  /* Let SDL name the extensions its own backend needs: on KMSDRM that is
+     VK_KHR_surface + VK_KHR_display, which is exactly what the Mali driver
+     exports, but hardcoding them would break on any other backend. */
+  SDL_Window *w = YabaGetSDLWindow();
+  unsigned int count = 0;
+  if (w == nullptr || SDL_Vulkan_GetInstanceExtensions(w, &count, nullptr) != SDL_TRUE) {
+    std::cerr << "SDL_Vulkan_GetInstanceExtensions failed: " << SDL_GetError() << "\n";
+    return;
+  }
+  std::vector<const char *> names(count);
+  if (SDL_Vulkan_GetInstanceExtensions(w, &count, names.data()) != SDL_TRUE) {
+    std::cerr << "SDL_Vulkan_GetInstanceExtensions(2) failed: " << SDL_GetError() << "\n";
+    return;
+  }
+  for (unsigned int i = 0; i < count; i++) {
+    std::cerr << "SDL requires instance extension: " << names[i] << "\n";
+    instance_extensions->push_back(names[i]);
+  }
+}
+
+#elif VK_USE_PLATFORM_DISPLAY_KHR
+
+void InitPlatform()
+{
+}
+
+void DeInitPlatform()
+{
+}
+
+void AddRequiredPlatformInstanceExtensions(std::vector<const char *> *instance_extensions)
+{
+  /* VK_KHR_display needs the display-properties entry points, which live in
+     VK_KHR_display itself, and that in turn requires
+     VK_KHR_get_display_properties2 on some drivers. Only the base extension
+     is mandatory, so request just that and let surface creation fail loudly
+     if the driver lacks it. */
+  instance_extensions->push_back(VK_KHR_DISPLAY_EXTENSION_NAME);
+}
+
 #endif

@@ -21,6 +21,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #pragma once
 
 extern "C" {
+#include "GpuTimer.h"
 #include "vidshared.h"
 #include "debug.h"
 #include "vdp2.h"
@@ -132,6 +133,7 @@ public:
   void Vdp1FrameChange(void);
   void SetSettingValue(int type, int value);
   void GetNativeResolution(int *width, int *height, int * interlace);
+  void drawMenuFrame(const char * title, const char * const * labels, const char * const * values, const int * selectable, int count, int selected, const char * footer);
   void Vdp2DispOff(void);
   void genLineinfo(vdp2draw_struct *info);
 
@@ -195,7 +197,7 @@ protected:
   Vdp1Renderer * vdp1;
   WindowRenderer * windowRenderer;
   uint64_t frameCount;
-  POLYGONMODE polygonMode;
+  POLYGONMODE polygonMode = PERSPECTIVE_CORRECTION;
   int rebuildPipelines = 0;
 
   VdpPipelineFactory * pipleLineFactory;
@@ -239,6 +241,7 @@ protected:
   int _rbg0priority = 0;
   int vdp1_interlace = 0;
 
+  YabaGpuTimer gpuTimer;   /* GPU time per pass of the scene command buffer */
   TextureManager * tm;
   VertexManager * vm;
 
@@ -271,6 +274,42 @@ protected:
 
   vdp2Lineinfo lineNBG0[512];
   vdp2Lineinfo lineNBG1[512];
+
+  /* ---- frame sets (CPU/GPU pipelining groundwork, YABA_VK_FRAMESETS=2) ------------------------------------------------------
+     Everything the CPU rewrites for every frame of the VDP2 scene exists twice, and the two sets are used alternately: the scene command
+     buffer of frame N reads set A while the CPU builds frame N+1 in set B. The members below (tm, vm, pipleLineFactory, windowRenderer,
+     fbRender, backPiepline, rbgGenerator, cram, lineColor, backColor, perline) always refer to the CURRENT set; selectNextFrameSet() swaps
+     them for the other set's. Off by default (one set, nothing changes). */
+  struct FrameSet {
+    TextureManager * tm = nullptr;
+    VertexManager * vm = nullptr;
+    VdpPipelineFactory * factory = nullptr;
+    WindowRenderer * windowRenderer = nullptr;
+    FramebufferRenderer * fbRender = nullptr;
+    VdpBack * back = nullptr;
+    RBGGeneratorVulkan * rbg = nullptr;
+    VdpPipeline * layerPipe[5] = { nullptr, nullptr, nullptr, nullptr, nullptr };   /* the per-layer pipelines NBG0..NBG3, RBG0 are kept between frames */
+    DynamicTexture cram, lineColor, backColor, perline[enBGMAX];
+    /* two frames in flight: each set has its own command pool (a pool must not be reset while one of its buffers is pending) and GPU timer */
+    VkCommandPool pool = VK_NULL_HANDLE;
+    std::vector<VkCommandBuffer> cbs;
+    YabaGpuTimer timer;
+    VkFence pendingFence = VK_NULL_HANDLE;   /* the scene submit of this set that has not been waited for yet (deferred mode) */
+    bool pendingMerge = false;
+  };
+  FrameSet frameSets[2];
+  TextureManager * setTm[2] = { nullptr, nullptr };   /* fixed at init, never swapped: read by the emulation thread (noteCramWrite) without a lock */
+  int frameSetCur = 0;
+  bool frameSetsDual = false;
+  u32 cramShadow[2048];   /* emulation-thread view of colour RAM as RGBA, copied into the current set's staging buffer by the render thread */
+  void saveFrameSet(FrameSet & s);
+  void loadFrameSet(const FrameSet & s);
+  void createFrameSetResources();
+  void selectNextFrameSet();
+  void completeAllInFlight();   /* every deferred scene/VDP1 submit finished and the queue idle */
+  void completePendingScene();   /* waits for the current set's deferred scene submit and finishes what followed it */
+  bool deferScene = false;
+  void destroyFrameSet(FrameSet & s);
 
   YabMutex * crammutex;
   DynamicTexture cram;
@@ -344,6 +383,11 @@ protected:
     VkRenderPass renderPass = VK_NULL_HANDLE;
     VkSampler sampler = VK_NULL_HANDLE;
     VkDescriptorImageInfo descriptor;
+    /* depth/stencil attachment: layer pipelines (built for the window pass, with depth+stencil state) are drawn into this
+       pass, so it must have the same attachment structure as the window pass to be compatible */
+    VkImage depthImage = VK_NULL_HANDLE;
+    VkDeviceMemory depthMem = VK_NULL_HANDLE;
+    VkImageView depthView = VK_NULL_HANDLE;
   };
 
   OffscreenPass offscreenPass;

@@ -32,6 +32,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #include "Platform.h"
 
 #include "Renderer.h"
+#include <cstring>
 #include "Shared.h"
 #include "Window.h"
 
@@ -42,6 +43,9 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #include <sstream>
 
 #include "VulkanTools.h"
+
+/* set while the physical device is inspected, read when the logical device is created */
+static bool g_robustBufferAccess = false;
 
 Renderer::Renderer()
 {
@@ -150,6 +154,18 @@ void Renderer::_SetupLayersAndExtensions()
 {
   _instance_extensions.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
   AddRequiredPlatformInstanceExtensions(&_instance_extensions);
+  if (YabaVkNamesWanted()) {
+    uint32_t n = 0;
+    vkEnumerateInstanceExtensionProperties(nullptr, &n, nullptr);
+    std::vector<VkExtensionProperties> props(n);
+    vkEnumerateInstanceExtensionProperties(nullptr, &n, props.data());
+    for (auto & e : props) {
+      if (strcmp(e.extensionName, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0) {
+        _instance_extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+        break;
+      }
+    }
+  }
 
   _device_extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
 }
@@ -162,7 +178,17 @@ void Renderer::_InitInstance()
   application_info.applicationVersion = VK_MAKE_VERSION(0, 1, 0);
   application_info.pEngineName = "YABASANSHIRO";
   application_info.engineVersion = 1;
-  application_info.apiVersion = VK_API_VERSION_1_0;
+  /* Every shader is compiled for Vulkan 1.1 / SPIR-V 1.3 (shaderc options in VdpPipeline.cpp, Vdp1Renderer.cpp,
+     FramebufferRenderer.cpp); a 1.0 instance makes those modules invalid (VUID-VkShaderModuleCreateInfo-pCode-08737).
+     Ask for 1.1 when the loader offers it, otherwise stay on 1.0. */
+  uint32_t instance_version = VK_API_VERSION_1_0;
+  {
+    auto enumerate_version = (PFN_vkEnumerateInstanceVersion)vkGetInstanceProcAddr(VK_NULL_HANDLE, "vkEnumerateInstanceVersion");
+    if (enumerate_version) enumerate_version(&instance_version);
+  }
+  application_info.apiVersion = (instance_version >= VK_API_VERSION_1_1) ? VK_API_VERSION_1_1 : VK_API_VERSION_1_0;
+  printf("VKINIT: loader instance version %u.%u.%u, requesting %u.%u\n", VK_VERSION_MAJOR(instance_version), VK_VERSION_MINOR(instance_version),
+         VK_VERSION_PATCH(instance_version), VK_VERSION_MAJOR(application_info.apiVersion), VK_VERSION_MINOR(application_info.apiVersion));
 
 
   VkInstanceCreateInfo instance_create_info{};
@@ -172,7 +198,10 @@ void Renderer::_InitInstance()
   instance_create_info.ppEnabledLayerNames = _instance_layers.data();
   instance_create_info.enabledExtensionCount = _instance_extensions.size();
   instance_create_info.ppEnabledExtensionNames = _instance_extensions.data();
-  instance_create_info.pNext = &_debug_callback_create_info;
+  /* Chain the debug-report struct only if _SetupDebug() actually filled it in. When
+     BUILD_ENABLE_VULKAN_DEBUG is off it is all zeroes, i.e. sType 0 =
+     VK_STRUCTURE_TYPE_APPLICATION_INFO, which is not a legal pNext member. */
+  instance_create_info.pNext = (_debug_callback_create_info.sType == VK_STRUCTURE_TYPE_DEBUG_REPORT_CALLBACK_CREATE_INFO_EXT) ? &_debug_callback_create_info : nullptr;
 
   ErrorCheck(vkCreateInstance(&instance_create_info, nullptr, &_instance));
 }
@@ -202,6 +231,16 @@ void Renderer::_InitDevice()
     }
     else {
       canUseTess = false;
+    }
+
+    /* robustBufferAccess: without it a shader read past the end of a buffer is undefined behaviour. lavapipe tolerates it; the Mali raises a page
+       fault (JOB_READ_FAULT, then VK_ERROR_DEVICE_LOST) -- the NiGHTS crash, which is first noticed in the rotation-layer compute path
+       (ygl_texture.cpp queue.waitIdle). With it enabled an out-of-range read returns zero instead. YABA_VK_ROBUST=0 turns it off for A/B tests. */
+    {
+      const char * e = getenv("YABA_VK_ROBUST");
+      const bool wanted = !(e && e[0] == '0');
+      g_robustBufferAccess = wanted && deviceFeatures.robustBufferAccess == VK_TRUE;
+      printf("ROBUST: robustBufferAccess supported=%d wanted=%d enabled=%d\n", (int)(deviceFeatures.robustBufferAccess == VK_TRUE), (int)wanted, (int)g_robustBufferAccess);
     }
   }
   {
@@ -234,7 +273,7 @@ void Renderer::_InitDevice()
     VkDeviceQueueCreateInfo device_queue_create_info{};
     device_queue_create_info.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
     device_queue_create_info.queueFamilyIndex = _graphics_family_index;
-    device_queue_create_info.queueCount = 2;
+    device_queue_create_info.queueCount = 1;   /* only queue 0 is ever fetched; the priorities array has ONE entry (was 2: read past the end, and invalid on a 1-queue family) */
     device_queue_create_info.pQueuePriorities = queue_priorities;
 
     VkDeviceQueueCreateInfo infos[] = { device_queue_create_info };
@@ -244,6 +283,7 @@ void Renderer::_InitDevice()
       features.tessellationShader = VK_TRUE;
       features.geometryShader = VK_TRUE;
     }
+    features.robustBufferAccess = g_robustBufferAccess ? VK_TRUE : VK_FALSE;
 
     VkDeviceCreateInfo device_create_info{};
     device_create_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -278,6 +318,7 @@ void Renderer::_InitDevice()
       features.tessellationShader = VK_TRUE;
       features.geometryShader = VK_TRUE;
     }
+    features.robustBufferAccess = g_robustBufferAccess ? VK_TRUE : VK_FALSE;
 
     VkDeviceCreateInfo device_create_info{};
     device_create_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
