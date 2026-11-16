@@ -9,14 +9,22 @@ Other RK3566 handhelds have the same chip but have not been tried on real hardwa
 
 ## Credits
 
-This project would not exist without the work of others.
+This project is a small layer on top of someone else's hard work, and that deserves saying plainly.
 
-- **pirry ([pirrypirrypirry](https://github.com/pirrypirrypirry))**: author of yabasanshiro-pirry, the source this fork is built on
-  (SH-2 dynarec work, game fixes, multi-disc support, the in-game menu, and the documentation). Everything here is a layer on top of it.
-- **devmiyax** ([devmiyax/yabause](https://github.com/devmiyax/yabause)): author of Yaba Sanshiro and of its Vulkan renderer,
-  which this fork works on.
-- **The Yabause developers**, on whose emulator Yaba Sanshiro is built.
+- **pirry ([pirrypirrypirry](https://github.com/pirrypirrypirry))** did the real work here. yabasanshiro-pirry is the emulator: the SH-2
+  dynarec that makes it fast, the long list of per-game fixes for games that froze, crashed or didn't boot, multi-disc support,
+  the in-game menu, and documentation good enough that a stranger could build it in an afternoon. Easily 95%+ of what runs when
+  you play a game through this fork is pirry's code, completely untouched. This fork only adds a second graphics backend on top
+  of it, nothing more. If you only take one thing from this README: go star
+  [yabasanshiro-pirry](https://github.com/pirrypirrypirry/yabasanshiro-pirry), that's where the actual emulator comes from, and
+  grab the [OpenGL ES release](https://github.com/pirrypirrypirry/yabasanshiro-pirry-release) he maintains if you don't specifically
+  want to test Vulkan.
+- **devmiyax** ([devmiyax/yabause](https://github.com/devmiyax/yabause)): author of Yaba Sanshiro itself and of the Vulkan renderer
+  this fork builds on, which was already sitting in pirry's tree unused on this chip.
+- **The Yabause developers**, who wrote the Saturn emulation core that all of the above runs on.
 - **dArkOS ([christianhaitian](https://github.com/christianhaitian/dArkOS))**: the OS this is developed and tested on, including its Vulkan support for RK3566.
+
+pirry has been kind enough to bless the name and the project while it's out testing with other RK3566 owners. Thank you.
 
 ## Download
 
