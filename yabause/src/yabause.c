@@ -50,6 +50,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #include <string.h>
 #include <stdlib.h>
 #include "yabause.h"
+#include "perflog.h"
 #include "cheat.h"
 #include "cs0.h"
 #include "cs2.h"
@@ -673,6 +674,85 @@ static unsigned int g_db_sec_dense = 0;   /* a field in the current second had >
 static unsigned int g_db_ring = 0;        /* bit i = second -i was dense (10 bits) */
 static unsigned int g_db_sec_fields = 0;
 int g_perline_parts = 2;   /* SH2Exec slices per line in the per-line path */
+
+
+/* ---------------------------------------------------------------------------
+   Subsystem timing for the RK3566 profiling build (perflog.h).
+
+   work_us showed the emulation thread using ~71% of the frame budget without
+   showing which subsystem spends it. Rather than edit twenty call sites, each
+   function gets a thin timing wrapper and is then macro-redirected to it.
+   The wrappers are defined BEFORE the #defines, so their own bodies call the
+   real functions and there is no recursion.
+
+   Disabled case is one load of g_perf_on and a branch. SH2Exec is called
+   thousands of times per frame, so the enabled case costs roughly 1% of the
+   frame budget in clock reads -- acceptable for a diagnostic build, and it is
+   the reason this instrumentation is opt-in rather than always on.
+   --------------------------------------------------------------------------- */
+static void Perf_SH2Exec(SH2_struct *c, u32 n) {
+  if (!g_perf_on) { SH2Exec(c, n); return; }
+  const long long t0 = PerfNowNs();
+  SH2Exec(c, n);
+  const long long d = PerfNowNs() - t0;
+  if (c == MSH2) g_perf_sh2m_ns += d; else g_perf_sh2s_ns += d;
+}
+
+#define PERF_WRAP_VOID(name, sink)                 \
+  static void Perf_##name(void) {                  \
+    if (!g_perf_on) { name(); return; }            \
+    const long long t0 = PerfNowNs();              \
+    name();                                        \
+    sink += PerfNowNs() - t0;                      \
+  }
+
+#define PERF_WRAP_ARG(name, type, sink)            \
+  static void Perf_##name(type a) {                \
+    if (!g_perf_on) { name(a); return; }           \
+    const long long t0 = PerfNowNs();              \
+    name(a);                                       \
+    sink += PerfNowNs() - t0;                      \
+  }
+
+PERF_WRAP_VOID(ScspExec, g_perf_scsp_ns)
+PERF_WRAP_VOID(M68KSync, g_perf_m68k_ns)
+/* Both still feed g_perf_vdp2_ns (so the vdp2_us column stays comparable with
+   earlier rounds) AND a per-phase accumulator. */
+static void Perf_Vdp2VBlankIN(void) {
+  if (!g_perf_on) { Vdp2VBlankIN(); return; }
+  const long long t0 = PerfNowNs();
+  Vdp2VBlankIN();
+  const long long d = PerfNowNs() - t0;
+  g_perf_vdp2_ns += d;
+  g_perf_vdp2in_ns += d;
+}
+static void Perf_Vdp2VBlankOUT(void) {
+  if (!g_perf_on) { Vdp2VBlankOUT(); return; }
+  const long long t0 = PerfNowNs();
+  Vdp2VBlankOUT();
+  const long long d = PerfNowNs() - t0;
+  g_perf_vdp2_ns += d;
+  g_perf_vdp2out_ns += d;
+}
+/* Per-scanline, 263x per frame, previously unmeasured. */
+PERF_WRAP_VOID(Vdp2HBlankIN, g_perf_hbin_ns)
+PERF_WRAP_VOID(Vdp2HBlankOUT, g_perf_hbout_ns)
+PERF_WRAP_ARG(ScuExec, u32, g_perf_scu_ns)
+PERF_WRAP_ARG(SmpcExec, s32, g_perf_smpc_ns)
+PERF_WRAP_ARG(Cs2Exec, u32, g_perf_cs2_ns)
+PERF_WRAP_ARG(M68KExec, s32, g_perf_m68kexec_ns)
+
+#define SH2Exec(c, n)    Perf_SH2Exec((c), (n))
+#define ScspExec()       Perf_ScspExec()
+#define M68KSync()       Perf_M68KSync()
+#define Vdp2VBlankIN()   Perf_Vdp2VBlankIN()
+#define Vdp2VBlankOUT()  Perf_Vdp2VBlankOUT()
+#define Vdp2HBlankIN()   Perf_Vdp2HBlankIN()
+#define Vdp2HBlankOUT()  Perf_Vdp2HBlankOUT()
+#define ScuExec(a)       Perf_ScuExec((a))
+#define SmpcExec(a)      Perf_SmpcExec((a))
+#define Cs2Exec(a)       Perf_Cs2Exec((a))
+#define M68KExec(a)      Perf_M68KExec((a))
 
 
 int YabauseEmulate(void) {

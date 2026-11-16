@@ -58,6 +58,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #include "threads.h"
 #include "yui.h"
 #include "frameprofile.h"
+#include "perflog.h"
 #include "vidogl.h"
 #include "vidsoft.h"
 #include <atomic>
@@ -801,6 +802,7 @@ extern "C" void * VdpProc( void *arg ){
 
   /* Bind the thread only once in modes >= 1 (mode 0 rebinds on every VDP event). */
   int v2_bound = 0;
+  long long vk_busy0 = 0;
   while( vdp_proc_running ){
     /* Mode 3 binds no thread at all and leaves placement to the scheduler. */
     if (!v2_bound) {
@@ -811,7 +813,13 @@ extern "C" void * VdpProc( void *arg ){
       YabThreadSetCurrentThreadAffinityMask(0x1);
 #endif
     }
+    /* Render-thread utilisation for the frame CSV: slot 15 = time blocked waiting for the next event (idle), slot 14 = time between
+       events (running a handler, including its fence waits). */
+    const long long vk_tw0 = PerfNowNs();
+    if (vk_busy0 != 0) PerfAddVk(14, vk_tw0 - vk_busy0);
     evcode = YabWaitEventQueue(evqueue);
+    vk_busy0 = PerfNowNs();
+    PerfAddVk(15, vk_busy0 - vk_tw0);
     switch(evcode){
     case VDPEV_VBLANK_IN:
       FrameProfileAdd("VIN start");
@@ -828,8 +836,11 @@ extern "C" void * VdpProc( void *arg ){
     case VDPEV_DIRECT_DRAW:
       FrameProfileAdd("DirectDraw start");
       FRAMELOG("VDP1: VDPEV_DIRECT_DRAW(T)");
-      Vdp1Draw();
-      VIDCore->Vdp1DrawEnd();
+      /* The VDP1 command-chain walk. This runs on the RENDER thread's event
+         loop, not inside YabauseExec(), so it is concurrent with work_us
+         rather than a component of it -- reported as its own column. */
+      PERF_TIME(PerfAddVdp1DrawNs, Vdp1Draw());
+      PERF_TIME(PerfAddVdp1DrawNs, VIDCore->Vdp1DrawEnd());
       Vdp1External.frame_change_plot = 0;
       FrameProfileAdd("DirectDraw end");
       Vdp1RcvSignal();
@@ -1055,6 +1066,16 @@ void frameSkipAndLimit() {
 
     diffticks = curticks - lastticks;
 
+    /* Record how late this frame is, on every frame and not only on the ones
+       that skip: the lateness is what causes a skip, so its distribution is
+       the thing worth having. Negative means ahead of schedule. */
+    if (g_perf_on && yabsys.tickfreq) {
+      const s64 behind = (s64)(onesecondticks + diffticks) - targetTime;
+      PerfSetBehindUs((long long)behind * 1000000LL / (long long)yabsys.tickfreq);
+      /* Defined in vdp1.cpp, bumped once per drawn command. */
+      extern unsigned int g_v1_drawn;
+      PerfSetV1Drawn(g_v1_drawn);
+    }
 
     if ( autoframeskipenab && (onesecondticks + diffticks) > targetTime )
     {
@@ -1064,6 +1085,7 @@ void frameSkipAndLimit() {
       // How many frames should we skip?
       framestoskip = 1;
 
+      if (g_perf_on) PerfSetSkipDecided(1);
     }
 
     // just wait for next vsync
@@ -1073,16 +1095,25 @@ void frameSkipAndLimit() {
 
       s64 sleeptime = (targetTime - (onesecondticks + diffticks));
       u64 xcurticks = YabauseGetTicks();
+      /* Everything from here to the end of the spin is deliberate pacing, not
+         emulation work. Timed so work_us can be recovered from exec_us. */
+      const long long _perf_limit_t0 = g_perf_on ? PerfNowNs() : 0;
       if (sleeptime-1000 > 0) {
         YabNanosleep(sleeptime-1000);
       }
 
+      const long long _perf_spin_t0 = g_perf_on ? PerfNowNs() : 0;
       for (;;)
       {
         curticks = YabauseGetTicks();
         diffticks = curticks - lastticks;
         if ((onesecondticks + diffticks) >= targetTime)
           break;
+      }
+      if (g_perf_on) {
+        const long long _perf_now = PerfNowNs();
+        PerfAddSpinNs(_perf_now - _perf_spin_t0);
+        PerfAddLimitNs(_perf_now - _perf_limit_t0);
       }
       //u64 realstime = YabauseGetTicks() - xcurticks;
       //yprintf("req time %d,real time %d diff = %d", (u32)sleeptime, (u32)realstime, realstime-sleeptime);
@@ -1142,7 +1173,9 @@ void Vdp2VBlankIN(void) {
   if (g_vin_decoupled) {
     /* Collect the token of the previous frame, then set status and interrupt here and continue
        without waiting for the render thread. */
-    Vdp2JoinPendingVIN();
+    /* Both joins BLOCK on the render thread. Timed separately so VDP2's share
+       of the frame can be split into work vs waiting. */
+    PERF_TIME(PerfAddJoinVinNs, Vdp2JoinPendingVIN());
     /* Wait until the backgrounds are drawn BEFORE the VBlank interrupt reaches the game. The game's
        VBlank routine writes scroll registers and line scroll tables and DMAs new data into VDP2 VRAM;
        if the render thread reads the tables line by line meanwhile, black bands appear during movement.
@@ -1150,7 +1183,7 @@ void Vdp2VBlankIN(void) {
        with Vdp1MarkRenderRetired() after Vdp2DrawScreens and does not include Vdp2DrawEnd,
        frameSkipAndLimit or Sync. This join is the only protection of the line scroll tables against
        the reading render thread; do not remove it. */
-    Vdp1JoinPendingRenders();   /* correctness join */
+    PERF_TIME(PerfAddJoinRenderNs, Vdp1JoinPendingRenders());   /* correctness join */
     g_tvmd_vin = Vdp2Regs->TVMD;   /* state before the game's VBlank routine */
     g_tvmd_vin_valid = 1;
     Vdp2Regs->TVSTAT |= 0x0008;
@@ -1167,7 +1200,9 @@ void Vdp2VBlankIN(void) {
 
    // sync
   //do {
-    YabWaitEventQueue(rcv_evqueue);
+    /* Timed: this is where the emu thread blocks waiting for the render
+       thread (seen as futex_wait_queue_me in ~85% of thread-state samples). */
+    PERF_TIME(PerfAddVdpWaitNs, YabWaitEventQueue(rcv_evqueue));
   //} while (YaGetQueueSize(rcv_evqueue) != 0);
    FrameProfileAdd("VIN sync");
 
@@ -1616,6 +1651,8 @@ static void FPSDisplay(void)
         unsigned int idle_skips = counter_delta(g_ls46_m, &idle_prev);
         unsigned int d_fields = counter_delta((unsigned int)g_frame_count, &field_prev);
         if (first_delta) { first_delta = 0; idle_skips = 0; d_fields = 0; }
+        /* Log the values already latched above; adds no measurement of its own. */
+        PerfLogSecond(fps, show_skipped_frame, show_vdp1_frame, idle_skips, d_fields);
         /* Adaptive first-slice rule (DynarecSh2.cpp). Step k = 0..11: at k==0 the rule is off; at k==1 the second
            just completed ran without it, and saturation = idle skips/(526 x fields) (526 = 2 time slices per line x
            263 lines). It is enabled only if saturation < 20 % and fields < 55. */

@@ -28,6 +28,7 @@ set(yabause_HEADERS
 	yabause.h ygl.h yui.h
 	shaders/FXAA_DefaultES.h
 	frameprofile.h
+	perflog.h
 	sh2cache.h
 	BackupManager.h
 	base64.h
@@ -52,6 +53,7 @@ set(yabause_SOURCES
 	osdcore.c
 	peripheral.c profile.c
 	frameprofile.cpp
+	perflog.cpp
 	scspdsp.c scu.c sh2core.c sh2d.c sh2iasm.c sh2idle.c sh2int.c sh2trace.c smpc.c snddummy.c
 	titan/titan.c
 	vdp1.cpp vdp2.cpp vdp2debug.c vidogl.c vidshared.c vidsoft.c
@@ -777,17 +779,52 @@ if (${CMAKE_SYSTEM_NAME} MATCHES "Windows")
 	include(vulkan/external_glfw.cmake)
 	set(LIBVULKAN_INCLUDE ${CMAKE_CURRENT_SOURCE_DIR}/vulkan/include)
 	set(LIBVULKAN ${CMAKE_CURRENT_SOURCE_DIR}/vulkan/lib/x86/vulkan-1.lib )
-else()
+elseif (ANDROID)
   set( SHADERC_INCLUDE_DIR ${ANDROID_NDK}/sources/third_party/shaderc/include  )
   set( SHADERC_LIBRARY_DIR ${ANDROID_NDK}/sources/third_party/shaderc/libs/c++_shared/${ANDROID_ABI}  )
 	set( SHADERC_LIBRARIES ${ANDROID_NDK}/sources/third_party/shaderc/libs/c++_shared/${ANDROID_ABI}/libshaderc.a  )
 	set( LIBVULKAN vulkan )
+else()
+  # Plain Linux (e.g. aarch64 handhelds). The branch above hardcoded the
+  # Android NDK's shaderc, so a non-Android Linux build resolved to an empty
+  # ${ANDROID_NDK} and failed. Debian ships shaderc and the Vulkan loader.
+  find_package(PkgConfig REQUIRED)
+  find_library(SHADERC_LIBRARIES NAMES shaderc_shared shaderc REQUIRED)
+  find_path(SHADERC_INCLUDE_DIR shaderc/shaderc.h REQUIRED)
+  set( LIBVULKAN vulkan )
+  # Surface backend. On these handhelds there is no X server and no Wayland
+  # compositor, so the upstream XCB path cannot work. SDL already creates the
+  # window and on KMSDRM it takes DRM master, so asking SDL for the Vulkan
+  # surface (its own KMSDRM backend uses VK_KHR_display underneath) keeps a
+  # single owner of the display. YAB_VK_DISPLAY is the no-SDL-video fallback.
+  option(YAB_VK_SDL "Vulkan surface via SDL2 (keeps SDL as display owner)" ON)
+  option(YAB_VK_DISPLAY "Vulkan via raw VK_KHR_display (no SDL video window)" OFF)
+  if (YAB_VK_SDL)
+    add_definitions(-DYAB_VK_SDL=1)
+    # Switches the front end's window to SDL_WINDOW_VULKAN and drops the GL
+    # context; this makes the resulting binary Vulkan-only.
+    add_definitions(-DYABA_VULKAN_ONLY=1)
+    set( VULKAN_SOURCES_PLATFORM vulkan/Window_sdl.cpp )
+  elseif (YAB_VK_DISPLAY)
+    add_definitions(-DYAB_VK_DISPLAY=1)
+    add_definitions(-DYABA_VULKAN_ONLY=1)
+    set( VULKAN_SOURCES_PLATFORM vulkan/Window_display.cpp )
+  else()
+    set( VULKAN_SOURCES_PLATFORM vulkan/Window_xcb.cpp )
+  endif()
 endif()
 
 #${ANDROID_NDK}/sources/third_party/shaderc/libshaderc/include 
 
 set(VULKAN_INCLUDE_DIRS ${GLM_INCLUDE_DIRS} ${GLFW_INCLUDE_DIR} ${SHADERC_INCLUDE_DIR} ${LIBVULKAN_INCLUDE} )
 set(VULKAN_LIBRARIES  ${GLFW_LIBRARIES} ${SHADERC_LIBRARIES} ${LIBVULKAN} )
+
+# VULKAN_LIBRARIES was set but never consumed: the retro_arena target links
+# ${YABAUSE_LIBRARIES} (retro_arena/CMakeLists.txt:97), so without this every
+# vk* and shaderc_* symbol is undefined at link time (839 of them).
+set(YABAUSE_LIBRARIES ${YABAUSE_LIBRARIES} ${VULKAN_LIBRARIES})
+message(STATUS "Vulkan libs: ${VULKAN_LIBRARIES}")
+message(STATUS "Vulkan includes: ${VULKAN_INCLUDE_DIRS}")
 
 set( VULKAN_SOURCES 
  vulkan/FramebufferRenderer.cpp
@@ -819,6 +856,7 @@ set( VULKAN_SOURCES
  vulkan/Shared.h
  vulkan/Window.cpp
  vulkan/Window.h
+ ${VULKAN_SOURCES_PLATFORM}
  nanovg/nanovg_vulkan_osdcore.cpp
 )
 
